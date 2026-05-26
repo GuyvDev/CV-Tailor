@@ -16,23 +16,6 @@ The app runs as a Docker Compose stack:
 - Stores generated artifacts under `outputs/<job_id>/`.
 - Provides a Personalize tab for editing your local profile files without committing them.
 
-## Privacy Model
-
-This repository is designed to be publishable without personal resume data.
-
-Private/local files are ignored by Git:
-
-- `.env` and `.env.*`
-- `data/profile/`
-- `data/now/`
-- `temp/`
-- `outputs/`
-- `docker-compose.override.yml`
-
-Public-safe sample data lives in `data/profile.example/`.
-
-Never commit your real API keys, contact details, grades, generated resumes, scanner reports, or source CV material.
-
 ## Setup
 
 1. Copy `.env.example` to `.env`.
@@ -146,26 +129,6 @@ python3 scripts/e2e_full_smoke.py
 ```
 
 The test creates a temporary profile under `data/profiles/`, switches to it, changes app settings, uses AI Setup Draft, saves generated profile files, creates a tailored CV, renders the PDF to `temp/e2e/*.png`, checks the image is nonblank, and restores the previously active profile.
-
-## Publish Checklist
-
-Before the first GitHub commit:
-
-```bash
-./scripts/publish_audit.sh
-```
-
-Then initialize Git only after reviewing the staged file list:
-
-```bash
-git init
-git status --short --ignored
-git add .
-git status --short
-git commit -m "Initial public release"
-```
-
-If a secret or personal file is ever committed, remove it from history before pushing and rotate the affected key.
 
 ## Current Boundaries
 
