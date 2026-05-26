@@ -1,0 +1,105 @@
+x-runtime-defaults: &runtime_defaults
+  restart: unless-stopped
+
+x-dns-defaults: &dns_defaults
+  dns:
+    - "${DOCKER_DNS_1:-1.1.1.1}"
+    - "${DOCKER_DNS_2:-8.8.8.8}"
+  dns_opt:
+    - timeout:2
+    - attempts:3
+
+services:
+  frontend:
+    <<: *runtime_defaults
+    build:
+      context: ./frontend
+      args:
+        VITE_API_BASE_URL: ${VITE_API_BASE_URL:-}
+    ports:
+      - "${FRONTEND_PORT:-3000}:80"
+    depends_on:
+      api:
+        condition: service_healthy
+
+  api:
+    <<: [*runtime_defaults, *dns_defaults]
+    build:
+      context: ./api
+    env_file:
+      - .env
+    environment:
+      LLM_PROVIDER: ${LLM_PROVIDER:-openai}
+      PROFILE_DIR: ${PROFILE_DIR:-/app/data/profile}
+      OUTPUT_DIR: ${OUTPUT_DIR:-/app/outputs}
+      COMPILER_URL: ${COMPILER_URL:-http://typst-compiler:8001}
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-http://localhost:8000}
+      MAX_COMPILE_RETRIES: ${MAX_COMPILE_RETRIES:-4}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      ABACUS_API_KEY: ${ABACUS_API_KEY:-}
+      ABACUS_BASE_URL: ${ABACUS_BASE_URL:-https://routellm.abacus.ai/v1}
+      MODEL_NAME: ${MODEL_NAME:-gpt-5-mini}
+      OPENAI_REASONING_EFFORT: ${OPENAI_REASONING_EFFORT:-low}
+      ENABLE_DEMO_MODE: ${ENABLE_DEMO_MODE:-true}
+    ports:
+      - "${API_PORT:-8000}:8000"
+    volumes:
+      - ./data:/app/data
+      - ./outputs:/app/outputs
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=5)",
+        ]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    depends_on:
+      typst-compiler:
+        condition: service_healthy
+
+  typst-compiler:
+    <<: *runtime_defaults
+    build:
+      context: ./compiler
+    ports:
+      - "${COMPILER_PORT:-8001}:8001"
+    environment:
+      TMP_DIR: /tmp/typst
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8001/health', timeout=5)",
+        ]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  telegram-bot:
+    <<: [*runtime_defaults, *dns_defaults]
+    build:
+      context: ./telegram-bot
+    env_file:
+      - .env
+    environment:
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
+      TELEGRAM_ALLOWED_USER_IDS: ${TELEGRAM_ALLOWED_USER_IDS:-}
+      API_URL: ${API_URL:-http://api:8000}
+      OUTPUT_BASENAME: ${OUTPUT_BASENAME:-tailored-resume}
+    depends_on:
+      api:
+        condition: service_healthy
+
+networks:
+  default:
+    driver: bridge
+    driver_opts:
+      com.docker.network.driver.mtu: 1400

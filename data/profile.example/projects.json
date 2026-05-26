@@ -1,0 +1,47 @@
+[
+  {
+    "title": "Local Resume Tailoring Assistant",
+    "dates": "2026",
+    "stack": [
+      "Python",
+      "FastAPI",
+      "React",
+      "Docker"
+    ],
+    "cv_status": "active",
+    "facts": [
+      "Built a Dockerized workflow that converts profile facts and job descriptions into structured resume drafts.",
+      "Added JSON validation and deterministic rendering so generated content stays reviewable before export.",
+      "Designed the app as a local-first system where private profile data remains outside the public repository."
+    ]
+  },
+  {
+    "title": "Project Analytics Dashboard",
+    "dates": "2025",
+    "stack": [
+      "TypeScript",
+      "React",
+      "SQL"
+    ],
+    "cv_status": "active",
+    "facts": [
+      "Created a dashboard for filtering project data, comparing status, and surfacing bottlenecks.",
+      "Modeled reusable UI state for search, sorting, and saved filters.",
+      "Documented setup steps so another developer could run the project locally."
+    ]
+  },
+  {
+    "title": "Automation Toolkit",
+    "dates": "2024",
+    "stack": [
+      "Python",
+      "Linux"
+    ],
+    "cv_status": "active",
+    "facts": [
+      "Wrote command-line utilities for parsing files, validating inputs, and producing reproducible reports.",
+      "Used clear configuration files to separate personal data from reusable code.",
+      "Improved repeatability by replacing manual checklist steps with scripted checks."
+    ]
+  }
+]

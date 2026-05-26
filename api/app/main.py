@@ -1,0 +1,1338 @@
+from __future__ import annotations
+
+import asyncio
+import base64
+import json
+import os
+import re
+import shutil
+
+import httpx
+from openai import OpenAI
+from dataclasses import dataclass, field
+from uuid import uuid4
+from pathlib import Path
+
+from fastapi import BackgroundTasks, FastAPI, HTTPException, status
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+
+from app.config import get_settings
+from app.data_loader import load_profile_data
+from app.models import (
+    AiProfileDraftRequest,
+    AiProfileDraftResponse,
+    AppSettingsResponse,
+    CreateProfileRequest,
+    EditPreviewRequest,
+    EditPreviewResponse,
+    GenerateRequest,
+    GenerateResponse,
+    JobMetadata,
+    PersonalizationOptions,
+    ProfileBundle,
+    ProfileSummary,
+    RuntimeConfigResponse,
+    SaveAppSettingsRequest,
+    SaveProfileBundleRequest,
+    ScoreResumeRequest,
+    SwitchProfileRequest,
+    ScoreResumeResponse,
+)
+from app.review_schema import ResumeScoreReport
+from app.renderer import render_resume
+from app.resume_schema import ResumeDraft
+from app.services.compiler_client import CompilerClient
+from app.services.job_store import JobStore
+from app.services.openai_service import ResumeGenerator
+
+
+settings = get_settings()
+job_store = JobStore(settings.output_dir)
+compiler_client = CompilerClient(settings.compiler_url)
+TERMINAL_STATUSES = {"completed", "failed", "stopped"}
+
+PROFILE_FILES = {
+    "master_profile": "master_profile.md",
+    "projects_json": "projects.json",
+    "skills_json": "skills.json",
+    "rules": "rules.md",
+    "research_guidelines": "research_guidelines.md",
+}
+
+LEGACY_PROFILE_ID = "default"
+
+
+def _profiles_root() -> Path:
+    return settings.profile_dir.parent / "profiles"
+
+
+def _active_profile_file() -> Path:
+    return settings.profile_dir.parent / "active_profile.txt"
+
+
+def _safe_profile_id(value: str) -> str:
+    safe = re.sub(r"[^a-zA-Z0-9_.-]+", "-", value.strip()).strip(".-_").lower()
+    if not safe:
+        raise HTTPException(status_code=422, detail="Profile id must contain at least one letter or number.")
+    if safe in {"profile", "profile.example", "now", "outputs", "temp"}:
+        raise HTTPException(status_code=422, detail="That profile id is reserved.")
+    return safe[:64]
+
+
+def _active_profile_id() -> str:
+    path = _active_profile_file()
+    if path.exists():
+        value = path.read_text(encoding="utf-8").strip()
+        if value:
+            return _safe_profile_id(value) if value != LEGACY_PROFILE_ID else LEGACY_PROFILE_ID
+    return os.getenv("ACTIVE_PROFILE_ID", LEGACY_PROFILE_ID).strip() or LEGACY_PROFILE_ID
+
+
+def _set_active_profile_id(profile_id: str) -> None:
+    profile_id = _safe_profile_id(profile_id) if profile_id != LEGACY_PROFILE_ID else LEGACY_PROFILE_ID
+    _active_profile_file().write_text(profile_id + "\n", encoding="utf-8")
+
+
+def _profile_dir(profile_id: str | None = None) -> Path:
+    profile_id = profile_id or _active_profile_id()
+    if profile_id == LEGACY_PROFILE_ID:
+        return settings.profile_dir
+    return _profiles_root() / _safe_profile_id(profile_id)
+
+
+def _profile_meta_path(profile_id: str | None = None) -> Path:
+    return _profile_dir(profile_id) / "profile_meta.json"
+
+
+def _profile_display_name(profile_id: str | None = None) -> str:
+    profile_id = profile_id or _active_profile_id()
+    path = _profile_meta_path(profile_id)
+    if path.exists():
+        try:
+            value = json.loads(path.read_text(encoding="utf-8")).get("display_name", "")
+            if value:
+                return str(value)
+        except Exception:
+            pass
+    return "Default" if profile_id == LEGACY_PROFILE_ID else profile_id.replace("-", " ").title()
+
+
+def _write_profile_meta(profile_id: str, display_name: str) -> None:
+    profile_dir = _profile_dir(profile_id)
+    profile_dir.mkdir(parents=True, exist_ok=True)
+    _profile_meta_path(profile_id).write_text(
+        json.dumps({"profile_id": profile_id, "display_name": display_name or _profile_display_name(profile_id)}, indent=2),
+        encoding="utf-8",
+    )
+
+
+def _list_profile_summaries() -> list[ProfileSummary]:
+    active_id = _active_profile_id()
+    summaries = [
+        ProfileSummary(
+            profile_id=LEGACY_PROFILE_ID,
+            display_name=_profile_display_name(LEGACY_PROFILE_ID),
+            active=active_id == LEGACY_PROFILE_ID,
+            profile_dir=str(settings.profile_dir),
+            exists=settings.profile_dir.exists(),
+        )
+    ]
+    root = _profiles_root()
+    if root.exists():
+        for child in sorted(path for path in root.iterdir() if path.is_dir()):
+            profile_id = child.name
+            summaries.append(
+                ProfileSummary(
+                    profile_id=profile_id,
+                    display_name=_profile_display_name(profile_id),
+                    active=active_id == profile_id,
+                    profile_dir=str(child),
+                    exists=child.exists(),
+                )
+            )
+    return summaries
+
+
+def _app_settings_path() -> Path:
+    return _profile_dir() / "app_settings.json"
+
+
+def _read_app_settings_secret() -> dict[str, object]:
+    data: dict[str, object] = {
+        "llm_provider": settings.llm_provider,
+        "model_name": settings.model_name,
+        "reasoning_effort": settings.reasoning_effort,
+        "abacus_base_url": settings.abacus_base_url,
+        "output_basename": os.getenv("OUTPUT_BASENAME", "tailored-resume"),
+        "enable_demo_mode": settings.enable_demo_mode,
+        "openai_api_key": settings.openai_api_key or "",
+        "abacus_api_key": settings.abacus_api_key or "",
+    }
+    path = _app_settings_path()
+    if path.exists():
+        saved = json.loads(path.read_text(encoding="utf-8"))
+        data.update({key: value for key, value in saved.items() if value is not None})
+    return data
+
+
+def _app_settings_response() -> AppSettingsResponse:
+    data = _read_app_settings_secret()
+    return AppSettingsResponse(
+        llm_provider=str(data.get("llm_provider") or "openai"),
+        model_name=str(data.get("model_name") or "gpt-5-mini"),
+        reasoning_effort=str(data.get("reasoning_effort") or "low"),
+        abacus_base_url=str(data.get("abacus_base_url") or "https://routellm.abacus.ai/v1"),
+        output_basename=str(data.get("output_basename") or "tailored-resume"),
+        enable_demo_mode=bool(data.get("enable_demo_mode", True)),
+        openai_api_key_configured=bool(str(data.get("openai_api_key") or "").strip()),
+        abacus_api_key_configured=bool(str(data.get("abacus_api_key") or "").strip()),
+    )
+
+
+def _write_app_settings(payload: SaveAppSettingsRequest) -> AppSettingsResponse:
+    _profile_dir().mkdir(parents=True, exist_ok=True)
+    current = _read_app_settings_secret()
+    next_data = {
+        "llm_provider": payload.llm_provider.strip().lower() or "openai",
+        "model_name": payload.model_name.strip() or "gpt-5-mini",
+        "reasoning_effort": payload.reasoning_effort.strip() or "low",
+        "abacus_base_url": payload.abacus_base_url.strip().rstrip("/") or "https://routellm.abacus.ai/v1",
+        "output_basename": payload.output_basename.strip() or "tailored-resume",
+        "enable_demo_mode": payload.enable_demo_mode,
+        "openai_api_key": payload.openai_api_key.strip() or str(current.get("openai_api_key") or ""),
+        "abacus_api_key": payload.abacus_api_key.strip() or str(current.get("abacus_api_key") or ""),
+    }
+    _app_settings_path().write_text(json.dumps(next_data, indent=2), encoding="utf-8")
+    return _app_settings_response()
+
+
+def _resume_generator() -> ResumeGenerator:
+    data = _read_app_settings_secret()
+    return ResumeGenerator(
+        provider=str(data.get("llm_provider") or "openai").strip().lower(),
+        api_key=str(data.get("openai_api_key") or "") or None,
+        abacus_api_key=str(data.get("abacus_api_key") or "") or None,
+        abacus_base_url=str(data.get("abacus_base_url") or "https://routellm.abacus.ai/v1"),
+        model_name=str(data.get("model_name") or "gpt-5-mini"),
+        reasoning_effort=str(data.get("reasoning_effort") or "low"),
+        enable_demo_mode=bool(data.get("enable_demo_mode", True)),
+    )
+
+
+def _output_basename() -> str:
+    return _safe_part(str(_read_app_settings_secret().get("output_basename") or "tailored-resume"), max_len=80)
+
+
+def _profile_draft_schema() -> dict:
+    return {
+        "name": "profile_personalization_draft",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "summary": {"type": "string"},
+                "master_profile": {"type": "string"},
+                "projects": {"type": "array", "items": {"type": "object", "additionalProperties": True}},
+                "skills": {"type": "object", "additionalProperties": {"type": "array", "items": {"type": "string"}}},
+                "rules": {"type": "string"},
+                "research_guidelines": {"type": "string"},
+                "personalization": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "required_profile_phrase": {"type": "string"},
+                        "required_profile_recommendation": {"type": "string"},
+                        "forbidden_content_regex": {"type": "string"},
+                        "forbidden_content_gap": {"type": "string"},
+                        "forbidden_content_recommendation": {"type": "string"},
+                        "fixed_education_typst": {"type": "string"},
+                        "contact_header_typst": {"type": "string"},
+                        "layout_density": {"type": "string"},
+                        "default_profile_text": {"type": "string"},
+                        "extra_prompt_notes": {"type": "string"},
+                    },
+                    "required": [
+                        "required_profile_phrase",
+                        "required_profile_recommendation",
+                        "forbidden_content_regex",
+                        "forbidden_content_gap",
+                        "forbidden_content_recommendation",
+                        "fixed_education_typst",
+                        "contact_header_typst",
+                        "layout_density",
+                        "default_profile_text",
+                        "extra_prompt_notes",
+                    ],
+                },
+            },
+            "required": [
+                "summary",
+                "master_profile",
+                "projects",
+                "skills",
+                "rules",
+                "research_guidelines",
+                "personalization",
+            ],
+        },
+    }
+
+
+def _build_ai_profile_prompt(source_text: str) -> tuple[str, str]:
+    system_prompt = """You convert messy candidate notes into private local profile files for a resume-tailoring app.
+Return only verified facts from the user's text. Do not invent employers, dates, metrics, awards, tools, degrees, or links.
+You must extract useful content when the user's text contains contact, education, projects, skills, honors, or writing preferences.
+Make the output easy for a human to review before saving. Return one JSON object only.
+Projects must be an array of objects with title, dates, stack, cv_status, and facts.
+Skills must be an object mapping categories to arrays of strings.
+Personalization should contain writing preferences and rendering rules only when clearly implied by the user.
+Use empty strings only for truly unknown personalization fields, not for the main profile when facts are provided.
+For forbidden_content_regex, write a valid Python regular expression only when the user explicitly names content that should be removed or not generated."""
+    user_prompt = f"""Create draft profile files from this user input.
+
+Return JSON with exactly this shape:
+{{
+  "summary": "one sentence explaining what was extracted",
+  "master_profile": "# Candidate Profile\n\n## Contact\n* Name: ...\n* Email: ...\n* Location: ...\n* LinkedIn: ...\n* GitHub: ...\n\n## Summary Facts\n* ...\n\n## Education\n* School\n* Degree\n* Dates\n* Coursework or honors",
+  "projects": [
+    {{"title": "Project name", "dates": "YYYY", "stack": ["Tool"], "cv_status": "active", "facts": ["Verified fact bullet"]}}
+  ],
+  "skills": {{"languages": ["Python"], "tools": ["Docker"]}},
+  "rules": "resume writing rules derived from the user's preferences",
+  "research_guidelines": "review/scoring guidance",
+  "personalization": {{
+    "required_profile_phrase": "",
+    "required_profile_recommendation": "",
+    "forbidden_content_regex": "",
+    "forbidden_content_gap": "",
+    "forbidden_content_recommendation": "",
+    "fixed_education_typst": "",
+    "contact_header_typst": "",
+    "layout_density": "compact",
+    "default_profile_text": "",
+    "extra_prompt_notes": ""
+  }}
+}}
+
+User input:
+{source_text}
+"""
+    return system_prompt, user_prompt
+
+
+def _profile_bundle_from_ai_payload(payload: dict) -> AiProfileDraftResponse:
+    profile = ProfileBundle(
+        profile_id=_active_profile_id(),
+        display_name=_profile_display_name(),
+        profile_dir=str(_profile_dir()),
+        exists=_profile_dir().exists(),
+        master_profile=str(payload.get("master_profile", "")),
+        projects_json=json.dumps(payload.get("projects", []), indent=2, ensure_ascii=False),
+        skills_json=json.dumps(payload.get("skills", {}), indent=2, ensure_ascii=False),
+        rules=str(payload.get("rules", "")),
+        research_guidelines=str(payload.get("research_guidelines", "")),
+        personalization=PersonalizationOptions.model_validate(payload.get("personalization", {})),
+        template_exists=(_profile_dir() / "templates" / "base_resume.typ").exists(),
+    )
+    return AiProfileDraftResponse(summary=str(payload.get("summary", "Draft created.")), profile=profile)
+
+
+def _validate_ai_profile_payload(payload: dict) -> None:
+    master_profile = str(payload.get("master_profile", "")).strip()
+    projects = payload.get("projects", [])
+    skills = payload.get("skills", {})
+    if len(master_profile) < 200:
+        raise HTTPException(status_code=502, detail="AI setup draft was too sparse; add more candidate notes or try again.")
+    if not isinstance(projects, list) or not projects:
+        raise HTTPException(status_code=502, detail="AI setup draft did not extract any projects.")
+    if not isinstance(skills, dict) or not any(skills.values()):
+        raise HTTPException(status_code=502, detail="AI setup draft did not extract any skills.")
+
+
+def _draft_profile_with_ai(source_text: str) -> AiProfileDraftResponse:
+    data = _read_app_settings_secret()
+    provider = str(data.get("llm_provider") or "openai").strip().lower()
+    model = str(data.get("model_name") or "gpt-5-mini")
+    system_prompt, user_prompt = _build_ai_profile_prompt(source_text)
+    schema = _profile_draft_schema()
+
+    if provider == "abacus":
+        api_key = str(data.get("abacus_api_key") or "")
+        if not api_key:
+            raise HTTPException(status_code=409, detail="Add an Abacus API key in App settings first.")
+        response = httpx.post(
+            f"{str(data.get('abacus_base_url') or 'https://routellm.abacus.ai/v1').rstrip('/')}/chat/completions",
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            json={
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                "response_format": {"type": "json_object"},
+            },
+            timeout=120,
+        )
+        response.raise_for_status()
+        content = response.json()["choices"][0]["message"]["content"]
+        payload = json.loads(content)
+        _validate_ai_profile_payload(payload)
+        return _profile_bundle_from_ai_payload(payload)
+
+    api_key = str(data.get("openai_api_key") or "")
+    if not api_key:
+        raise HTTPException(status_code=409, detail="Add an OpenAI API key in App settings first.")
+    client = OpenAI(api_key=api_key)
+    response = client.responses.create(
+        model=model,
+        input=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        text={"format": {"type": "json_schema", **schema}},
+    )
+    payload = response.output_text
+    if not payload:
+        raise HTTPException(status_code=502, detail="AI returned an empty profile draft.")
+    decoded = json.loads(payload)
+    _validate_ai_profile_payload(decoded)
+    return _profile_bundle_from_ai_payload(decoded)
+
+
+def _read_profile_file(filename: str, default: str = "") -> str:
+    path = _profile_dir() / filename
+    if not path.exists():
+        return default
+    return path.read_text(encoding="utf-8")
+
+
+def _example_profile_dir() -> Path:
+    return settings.profile_dir.parent / "profile.example"
+
+
+def _initialize_profile_templates() -> None:
+    source_templates = _example_profile_dir() / "templates"
+    target_templates = _profile_dir() / "templates"
+    if not source_templates.exists() or target_templates.exists():
+        return
+    shutil.copytree(source_templates, target_templates)
+
+
+
+def _read_personalization() -> PersonalizationOptions:
+    path = _profile_dir() / "personalization.json"
+    if not path.exists():
+        return PersonalizationOptions()
+    return PersonalizationOptions.model_validate_json(path.read_text(encoding="utf-8"))
+
+
+def _write_personalization(personalization: PersonalizationOptions) -> None:
+    (_profile_dir() / "personalization.json").write_text(
+        personalization.model_dump_json(indent=2),
+        encoding="utf-8",
+    )
+
+
+def _profile_bundle() -> ProfileBundle:
+    return ProfileBundle(
+        profile_id=_active_profile_id(),
+        display_name=_profile_display_name(),
+        profile_dir=str(_profile_dir()),
+        exists=_profile_dir().exists(),
+        master_profile=_read_profile_file("master_profile.md"),
+        projects_json=_read_profile_file("projects.json", "[]"),
+        skills_json=_read_profile_file("skills.json", "{}"),
+        rules=_read_profile_file("rules.md"),
+        research_guidelines=_read_profile_file("research_guidelines.md"),
+        personalization=_read_personalization(),
+        template_exists=(_profile_dir() / "templates" / "base_resume.typ").exists(),
+    )
+
+APPROVED_EDIT_ONE_PAGE_INSTRUCTIONS = (
+    "Make this approved edit fit on exactly one page. Keep the same role target and "
+    "the same verified facts. Shorten the profile, compress wording, trim weaker bullets, "
+    "and remove low-value redundancy without adding new facts."
+)
+
+
+@dataclass
+class JobControl:
+    cancel_event: asyncio.Event = field(default_factory=asyncio.Event)
+    task: asyncio.Task | None = None
+
+
+job_controls: dict[str, JobControl] = {}
+
+app = FastAPI(title="cv-docker-api", version="0.1.0")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+app.mount("/files", StaticFiles(directory=settings.output_dir), name="files")
+
+
+@app.get("/api/config", response_model=RuntimeConfigResponse)
+async def runtime_config() -> RuntimeConfigResponse:
+    return RuntimeConfigResponse(
+        llm_provider=_app_settings_response().llm_provider,
+        model_name=_app_settings_response().model_name,
+        live_model_available=_resume_generator().has_live_model(),
+        demo_mode_enabled=_app_settings_response().enable_demo_mode,
+        profile_dir=str(_profile_dir()),
+        output_dir=str(settings.output_dir),
+        output_basename=_app_settings_response().output_basename,
+        personalized_profile_phrase_configured=bool(_read_personalization().required_profile_phrase.strip()),
+        personalized_forbidden_rule_configured=bool(_read_personalization().forbidden_content_regex.strip()),
+        openai_api_key_configured=_app_settings_response().openai_api_key_configured,
+        abacus_api_key_configured=_app_settings_response().abacus_api_key_configured,
+    )
+
+
+@app.get("/api/app-settings", response_model=AppSettingsResponse)
+async def get_app_settings() -> AppSettingsResponse:
+    return _app_settings_response()
+
+
+@app.post("/api/app-settings", response_model=AppSettingsResponse)
+async def save_app_settings(payload: SaveAppSettingsRequest) -> AppSettingsResponse:
+    return _write_app_settings(payload)
+
+
+@app.get("/api/profiles", response_model=list[ProfileSummary])
+async def list_profiles() -> list[ProfileSummary]:
+    return _list_profile_summaries()
+
+
+@app.post("/api/profiles", response_model=ProfileSummary)
+async def create_profile(payload: CreateProfileRequest) -> ProfileSummary:
+    profile_id = _safe_profile_id(payload.profile_id)
+    profile_dir = _profile_dir(profile_id)
+    if profile_dir.exists() and any(profile_dir.iterdir()):
+        raise HTTPException(status_code=409, detail="Profile already exists.")
+    profile_dir.mkdir(parents=True, exist_ok=True)
+    if payload.copy_example:
+        example_dir = _example_profile_dir()
+        if example_dir.exists():
+            for item in example_dir.iterdir():
+                target = profile_dir / item.name
+                if item.is_dir():
+                    shutil.copytree(item, target, dirs_exist_ok=True)
+                else:
+                    shutil.copy2(item, target)
+    _write_profile_meta(profile_id, payload.display_name or profile_id.replace("-", " ").title())
+    _set_active_profile_id(profile_id)
+    return next(summary for summary in _list_profile_summaries() if summary.profile_id == profile_id)
+
+
+@app.post("/api/profiles/active", response_model=ProfileSummary)
+async def switch_profile(payload: SwitchProfileRequest) -> ProfileSummary:
+    profile_id = payload.profile_id if payload.profile_id == LEGACY_PROFILE_ID else _safe_profile_id(payload.profile_id)
+    if not _profile_dir(profile_id).exists():
+        raise HTTPException(status_code=404, detail="Profile not found.")
+    _set_active_profile_id(profile_id)
+    return next(summary for summary in _list_profile_summaries() if summary.profile_id == profile_id)
+
+
+@app.delete("/api/profiles/{profile_id}", status_code=204)
+async def delete_profile(profile_id: str) -> None:
+    if profile_id == LEGACY_PROFILE_ID:
+        raise HTTPException(status_code=409, detail="The default profile cannot be deleted.")
+    profile_id = _safe_profile_id(profile_id)
+    if profile_id == _active_profile_id():
+        raise HTTPException(status_code=409, detail="Switch to another profile before deleting this one.")
+
+    profile_dir = _profile_dir(profile_id)
+    if not profile_dir.exists():
+        raise HTTPException(status_code=404, detail="Profile not found.")
+
+    root = _profiles_root().resolve()
+    resolved = profile_dir.resolve()
+    if resolved.parent != root:
+        raise HTTPException(status_code=400, detail="Invalid profile path.")
+    shutil.rmtree(resolved)
+
+
+@app.get("/api/profile", response_model=ProfileBundle)
+async def get_profile() -> ProfileBundle:
+    return _profile_bundle()
+
+
+@app.post("/api/profile/ai-draft", response_model=AiProfileDraftResponse)
+async def draft_profile_with_ai(payload: AiProfileDraftRequest) -> AiProfileDraftResponse:
+    try:
+        return await asyncio.to_thread(_draft_profile_with_ai, payload.source_text)
+    except httpx.HTTPStatusError as exc:
+        raise HTTPException(status_code=502, detail=f"AI provider rejected the setup draft request: {exc.response.text[:400]}") from exc
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=502, detail="AI returned invalid JSON for the profile draft.") from exc
+
+
+@app.post("/api/profile", response_model=ProfileBundle)
+async def save_profile(payload: SaveProfileBundleRequest) -> ProfileBundle:
+    try:
+        json.loads(payload.projects_json or "[]")
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=422, detail=f"projects_json is invalid JSON: {exc.msg}") from exc
+    try:
+        json.loads(payload.skills_json or "{}")
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=422, detail=f"skills_json is invalid JSON: {exc.msg}") from exc
+    if payload.personalization.forbidden_content_regex.strip():
+        try:
+            re.compile(payload.personalization.forbidden_content_regex)
+        except re.error as exc:
+            raise HTTPException(status_code=422, detail=f"forbidden_content_regex is invalid: {exc}") from exc
+
+    _profile_dir().mkdir(parents=True, exist_ok=True)
+    (_profile_dir() / "examples").mkdir(exist_ok=True)
+    (_profile_dir() / "notes").mkdir(exist_ok=True)
+    if payload.initialize_templates:
+        _initialize_profile_templates()
+
+    values = {
+        "master_profile.md": payload.master_profile,
+        "projects.json": payload.projects_json,
+        "skills.json": payload.skills_json,
+        "rules.md": payload.rules,
+        "research_guidelines.md": payload.research_guidelines,
+    }
+    for filename, content in values.items():
+        (_profile_dir() / filename).write_text(content.rstrip() + "\n", encoding="utf-8")
+    _write_personalization(payload.personalization)
+    return _profile_bundle()
+
+
+@app.get("/api/health")
+async def healthcheck() -> dict[str, str]:
+    mode = "live" if _resume_generator().has_live_model() else "demo"
+    return {"status": "ok", "mode": mode}
+
+
+@app.post("/api/generate", response_model=GenerateResponse, status_code=202)
+async def generate_resume(
+    payload: GenerateRequest,
+    background_tasks: BackgroundTasks,
+) -> GenerateResponse:
+    job_id = uuid4().hex[:12]
+    job_store.create_job(
+        job_id,
+        payload.role_focus,
+        payload.template,
+        extra={
+            "label": payload.label,
+            "source_url": payload.source_url,
+            "job_description": payload.job_description,
+        },
+    )
+    _job_control(job_id)
+    background_tasks.add_task(run_generation_job, job_id, payload)
+    return GenerateResponse(job_id=job_id, status="queued")
+
+
+@app.post("/api/edit-preview", response_model=EditPreviewResponse)
+async def edit_preview(payload: EditPreviewRequest) -> EditPreviewResponse:
+    try:
+        source_job = job_store.load(payload.source_job_id)
+        previous_draft = _load_stored_draft(payload.source_job_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="Source CV draft not found") from exc
+
+    job_description = source_job.extra.get("job_description", "")
+    if not job_description:
+        raise HTTPException(status_code=409, detail="Original job description is missing")
+
+    profile = await asyncio.to_thread(load_profile_data, _profile_dir())
+    request = GenerateRequest(
+        job_description=job_description,
+        role_focus=source_job.role_focus,
+        template=source_job.template,
+        label=source_job.extra.get("label", ""),
+        source_url=source_job.extra.get("source_url", ""),
+        source_job_id=payload.source_job_id,
+        edit_instructions=payload.edit_instructions,
+    )
+    edited_draft = await asyncio.to_thread(
+        _resume_generator().generate_resume,
+        profile,
+        request,
+        1,
+        previous_draft,
+    )
+    return EditPreviewResponse(before_draft=previous_draft, after_draft=edited_draft)
+
+
+@app.post("/api/score-existing", response_model=ScoreResumeResponse)
+async def score_existing_resume(payload: ScoreResumeRequest) -> ScoreResumeResponse:
+    try:
+        source_job = job_store.load(payload.source_job_id)
+        draft = _load_stored_draft(payload.source_job_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="Source CV draft not found") from exc
+
+    job_description = payload.job_description or source_job.extra.get("job_description", "")
+    if not job_description:
+        raise HTTPException(status_code=409, detail="Original job description is missing")
+
+    profile = await asyncio.to_thread(load_profile_data, _profile_dir())
+    request = GenerateRequest(
+        job_description=job_description,
+        role_focus=source_job.role_focus,
+        template=source_job.template,
+        label=source_job.extra.get("label", ""),
+        source_url=source_job.extra.get("source_url", ""),
+        source_job_id=payload.source_job_id,
+    )
+    compile_feedback = (
+        f"success=True, page_count={source_job.page_count}, log=n/a"
+        if source_job.page_count is not None
+        else None
+    )
+    report = await asyncio.to_thread(
+        _resume_generator().score_resume,
+        profile,
+        request,
+        draft,
+        1,
+        1,
+        compile_feedback,
+    )
+    return ScoreResumeResponse(
+        source_job_id=payload.source_job_id,
+        used_original_job_description=payload.job_description is None,
+        report=report,
+    )
+
+
+def _safe_part(s: str, max_len: int = 30) -> str:
+    """Sanitize a string for use in a filename."""
+    return re.sub(r"[^\w\-]", "_", s.strip())[:max_len].strip("_") or "unknown"
+
+
+def _normalize_lookup(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", value.lower())
+
+
+def _job_control(job_id: str) -> JobControl:
+    control = job_controls.get(job_id)
+    if control is None:
+        control = JobControl()
+        job_controls[job_id] = control
+    return control
+
+
+def _stop_metadata(
+    metadata: JobMetadata,
+    *,
+    error: str = "Stopped by user.",
+    page_count: int | None = None,
+    compile_logs: list[str] | None = None,
+    pdf_url: str | None = None,
+    typst_url: str | None = None,
+) -> JobMetadata:
+    return job_store.record_status(
+        metadata,
+        status="stopped",
+        stage="stopped",
+        page_count=page_count if page_count is not None else metadata.page_count,
+        compile_logs=compile_logs if compile_logs is not None else metadata.compile_logs,
+        pdf_url=pdf_url if pdf_url is not None else metadata.pdf_url,
+        typst_url=typst_url if typst_url is not None else metadata.typst_url,
+        error=error,
+    )
+
+
+def _load_stored_draft(job_id: str) -> ResumeDraft:
+    draft_path = settings.output_dir / job_id / "draft.json"
+    if not draft_path.exists():
+        raise FileNotFoundError(f"Draft for job '{job_id}' not found")
+    return ResumeDraft.model_validate_json(draft_path.read_text(encoding="utf-8"))
+
+
+@app.get("/api/jobs")
+async def list_jobs() -> list[dict]:
+    """List all jobs sorted newest first."""
+    jobs = []
+    for job_dir in settings.output_dir.iterdir():
+        meta_path = job_dir / "metadata.json"
+        if not meta_path.exists():
+            continue
+        try:
+            meta = JobMetadata.model_validate_json(meta_path.read_text(encoding="utf-8"))
+            jobs.append({
+                "job_id": meta.job_id,
+                "status": meta.status,
+                "label": meta.extra.get("label", ""),
+                "job_title": meta.extra.get("job_title", ""),
+                "created_at": meta.created_at.isoformat(),
+            })
+        except Exception:
+            continue
+    jobs.sort(key=lambda j: j["created_at"], reverse=True)
+    return jobs
+
+
+@app.delete("/api/jobs/{job_id}", status_code=204)
+async def delete_job(job_id: str) -> None:
+    try:
+        metadata = job_store.load(job_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="Job not found") from exc
+    control = job_controls.get(job_id)
+    if control is not None and control.task is not None and not control.task.done():
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Job is still stopping. Try again in a few seconds.",
+        )
+    if metadata.status not in TERMINAL_STATUSES:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Stop the job before deleting it.",
+        )
+    try:
+        job_store.delete(job_id)
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to delete job '{job_id}'") from exc
+    job_controls.pop(job_id, None)
+
+
+@app.post("/api/jobs/{job_id}/stop", response_model=JobMetadata)
+async def stop_job(job_id: str) -> JobMetadata:
+    try:
+        metadata = job_store.load(job_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="Job not found") from exc
+
+    if metadata.status in TERMINAL_STATUSES:
+        return metadata
+
+    control = _job_control(job_id)
+    control.cancel_event.set()
+    updated = _stop_metadata(metadata)
+    if control.task is not None and not control.task.done():
+        control.task.cancel()
+    return updated
+
+
+@app.get("/api/jobs/by-label/{label}", response_model=JobMetadata)
+async def get_job_by_label(label: str) -> JobMetadata:
+    """Return the most recent completed job whose label exactly matches the search string."""
+    matches: list[JobMetadata] = []
+    normalized_label = _normalize_lookup(label)
+    for job_dir in settings.output_dir.iterdir():
+        meta_path = job_dir / "metadata.json"
+        if not meta_path.exists():
+            continue
+        try:
+            meta = JobMetadata.model_validate_json(meta_path.read_text(encoding="utf-8"))
+            stored = _normalize_lookup(meta.extra.get("label", ""))
+            if normalized_label and stored == normalized_label:
+                matches.append(meta)
+        except Exception:
+            continue
+    if not matches:
+        raise HTTPException(status_code=404, detail=f"No job found with label '{label}'")
+    matches.sort(key=lambda m: m.created_at)
+    completed = [m for m in matches if m.status == "completed"]
+    return completed[-1] if completed else matches[-1]
+
+
+@app.get("/api/jobs/by-id/{short_id}", response_model=JobMetadata)
+async def get_job_by_short_id(short_id: str) -> JobMetadata:
+    """Find a job by exact id or a unique id prefix."""
+    exact_match: JobMetadata | None = None
+    prefix_matches: list[JobMetadata] = []
+    for job_dir in settings.output_dir.iterdir():
+        meta_path = job_dir / "metadata.json"
+        if not meta_path.exists():
+            continue
+        meta = JobMetadata.model_validate_json(meta_path.read_text(encoding="utf-8"))
+        if meta.job_id == short_id:
+            exact_match = meta
+            break
+        if meta.job_id.startswith(short_id):
+            prefix_matches.append(meta)
+    if exact_match is not None:
+        return exact_match
+    if len(prefix_matches) == 1:
+        return prefix_matches[0]
+    if len(prefix_matches) > 1:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"More than one job matches id prefix '{short_id}'",
+        )
+    raise HTTPException(status_code=404, detail=f"No job found with id prefix '{short_id}'")
+
+
+@app.get("/api/jobs/{job_id}", response_model=JobMetadata)
+async def get_job(job_id: str) -> JobMetadata:
+    try:
+        return job_store.load(job_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="Job not found") from exc
+
+
+def _score_report_text(report: ResumeScoreReport) -> str:
+    strengths = "\n".join(f"- {item}" for item in report.strengths) or "- None"
+    gaps = "\n".join(f"- {item}" for item in report.gaps) or "- None"
+    recommendations = "\n".join(f"- {item}" for item in report.recommendations) or "- None"
+    return (
+        f"Quality score: {report.quality_score}/100\n"
+        f"Match score: {report.match_score}/100\n"
+        f"Band: {report.score_band}\n"
+        f"Decision: {report.decision}\n\n"
+        f"Summary:\n{report.summary}\n\n"
+        f"Strengths:\n{strengths}\n\n"
+        f"Gaps:\n{gaps}\n\n"
+        f"Recommendations:\n{recommendations}\n\n"
+        f"Revision brief:\n{report.revision_brief}\n"
+    )
+
+
+async def run_generation_job(job_id: str, payload: GenerateRequest) -> None:
+    metadata = job_store.load(job_id)
+    control = _job_control(job_id)
+    control.task = asyncio.current_task()
+    compile_logs: list[str] = []
+    last_page_count: int | None = None
+    last_typst_source = ""
+    last_pdf_bytes: bytes | None = None
+    compile_error = False
+    stop_reason = "Stopped by user."
+    last_score_report: ResumeScoreReport | None = None
+    compile_feedback: str | None = None
+    best_candidate: dict[str, object] | None = None
+
+    def check_cancel() -> None:
+        if control.cancel_event.is_set():
+            raise asyncio.CancelledError
+
+    def remember_best_candidate(draft: ResumeDraft, report: ResumeScoreReport | None) -> None:
+        nonlocal best_candidate
+        if last_page_count != 1 or not last_pdf_bytes:
+            return
+        score_value = 0
+        if report is not None:
+            score_value = report.quality_score + report.match_score
+            if report.decision == "approve":
+                score_value += 1000
+        current_score = int(best_candidate["score"]) if best_candidate else -1
+        if score_value <= current_score:
+            return
+        best_candidate = {
+            "draft": draft.model_copy(deep=True),
+            "report": report.model_copy(deep=True) if report else None,
+            "typst": last_typst_source,
+            "pdf": last_pdf_bytes,
+            "page_count": last_page_count,
+            "score": score_value,
+        }
+
+    def persist_score_report(report: ResumeScoreReport | None) -> None:
+        if report is None:
+            return
+        job_store.write_text_artifact(job_id, "score_report.json", report.model_dump_json(indent=2))
+        job_store.write_text_artifact(job_id, "score_report.txt", _score_report_text(report))
+
+    def finalize_approved_success(draft: ResumeDraft) -> None:
+        nonlocal metadata
+        if not last_pdf_bytes:
+            raise RuntimeError("Missing compiled PDF bytes for approved draft.")
+        output_base = _output_basename()
+        job_store.write_text_artifact(job_id, "resume.typ", last_typst_source)
+        job_store.write_binary_artifact(job_id, "resume.pdf", last_pdf_bytes)
+        job_store.write_text_artifact(job_id, f"{output_base}.typ", last_typst_source)
+        job_store.write_binary_artifact(job_id, f"{output_base}.pdf", last_pdf_bytes)
+        job_store.write_text_artifact(job_id, "draft.json", draft.model_dump_json(indent=2))
+
+        ts = metadata.created_at
+        archive_name = "-".join([
+            job_id[:8],
+            ts.strftime("%H%M"),
+            ts.strftime("%Y%m%d"),
+            _safe_part(payload.label or "unknown"),
+            _safe_part(draft.job_title or "resume"),
+        ])
+        job_store.write_text_artifact(job_id, f"{archive_name}.typ", last_typst_source)
+        job_store.write_binary_artifact(job_id, f"{archive_name}.pdf", last_pdf_bytes)
+        source_url = payload.source_url
+        txt = (
+            f"Source URL: {source_url}\n\n"
+            if source_url else ""
+        ) + f"--- JOB DESCRIPTION ---\n{payload.job_description}"
+        job_store.write_text_artifact(job_id, f"{archive_name}.txt", txt)
+
+        metadata = job_store.record_status(
+            metadata,
+            status="completed",
+            stage="completed",
+            page_count=1,
+            compile_logs=compile_logs,
+            pdf_url=f"/files/{job_id}/{_output_basename()}.pdf",
+            typst_url=f"/files/{job_id}/{_output_basename()}.typ",
+            fit_summary=draft.fit_summary,
+            keywords=draft.keywords,
+            extra={
+                **metadata.extra,
+                "job_title": draft.job_title,
+                "archive_name": archive_name,
+            },
+        )
+
+    def finalize_success(draft: ResumeDraft, report: ResumeScoreReport | None) -> None:
+        nonlocal metadata
+        if not last_pdf_bytes:
+            raise RuntimeError("Missing compiled PDF bytes for final draft.")
+        output_base = _output_basename()
+        job_store.write_text_artifact(job_id, "resume.typ", last_typst_source)
+        job_store.write_binary_artifact(job_id, "resume.pdf", last_pdf_bytes)
+        job_store.write_text_artifact(job_id, f"{output_base}.typ", last_typst_source)
+        job_store.write_binary_artifact(job_id, f"{output_base}.pdf", last_pdf_bytes)
+        job_store.write_text_artifact(job_id, "draft.json", draft.model_dump_json(indent=2))
+        persist_score_report(report)
+
+        ts = metadata.created_at
+        archive_name = "-".join([
+            job_id[:8],
+            ts.strftime("%H%M"),
+            ts.strftime("%Y%m%d"),
+            _safe_part(payload.label or "unknown"),
+            _safe_part(draft.job_title or "resume"),
+        ])
+        job_store.write_text_artifact(job_id, f"{archive_name}.typ", last_typst_source)
+        job_store.write_binary_artifact(job_id, f"{archive_name}.pdf", last_pdf_bytes)
+        source_url = payload.source_url
+        txt = (
+            f"Source URL: {source_url}\n\n"
+            if source_url else ""
+        ) + f"--- JOB DESCRIPTION ---\n{payload.job_description}"
+        job_store.write_text_artifact(job_id, f"{archive_name}.txt", txt)
+
+        metadata = job_store.record_status(
+            metadata,
+            status="completed",
+            stage="completed",
+            page_count=1,
+            compile_logs=compile_logs,
+            pdf_url=f"/files/{job_id}/{_output_basename()}.pdf",
+            typst_url=f"/files/{job_id}/{_output_basename()}.typ",
+            fit_summary=draft.fit_summary,
+            review_summary=report.summary if report else None,
+            quality_score=report.quality_score if report else None,
+            match_score=report.match_score if report else None,
+            score_band=report.score_band if report else None,
+            keywords=draft.keywords,
+            recommendations=report.recommendations if report else [],
+            extra={
+                **metadata.extra,
+                "job_title": draft.job_title,
+                "archive_name": archive_name,
+                "score_report_json_url": f"/files/{job_id}/score_report.json" if report else None,
+                "score_report_txt_url": f"/files/{job_id}/score_report.txt" if report else None,
+            },
+        )
+
+    async def compile_exact_draft(draft: ResumeDraft, *, stage: str) -> bool:
+        nonlocal metadata, last_typst_source, last_pdf_bytes, last_page_count, compile_error, compile_logs
+        check_cancel()
+        last_typst_source = render_resume(profile.template, draft, profile.personalization)
+        metadata = job_store.record_status(
+            metadata,
+            stage=stage,
+            attempts=1,
+            keywords=draft.keywords,
+            fit_summary=draft.fit_summary,
+            error=None,
+        )
+        compile_result = await compiler_client.compile(last_typst_source)
+        check_cancel()
+        compile_logs.append(
+            f"Attempt 1: success={compile_result.success}, "
+            f"page_count={compile_result.page_count}, "
+            f"log={compile_result.compile_log.strip() or 'n/a'}"
+        )
+        last_page_count = compile_result.page_count
+        last_pdf_bytes = (
+            base64.b64decode(compile_result.pdf_base64)
+            if compile_result.pdf_base64
+            else None
+        )
+        if not compile_result.success:
+            compile_error = True
+            metadata = job_store.record_status(metadata, compile_logs=compile_logs)
+            return False
+        return bool(compile_result.page_count == 1 and last_pdf_bytes)
+
+    # Load previous draft when editing an existing CV
+    draft: ResumeDraft | None = payload.approved_draft
+    if draft is None and payload.source_job_id:
+        draft_path = settings.output_dir / payload.source_job_id / "draft.json"
+        if draft_path.exists():
+            draft = ResumeDraft.model_validate_json(draft_path.read_text(encoding="utf-8"))
+
+    try:
+        if metadata.status == "stopped":
+            return
+        check_cancel()
+        metadata = job_store.record_status(
+            metadata,
+            status="running",
+            stage="loading_profile",
+            attempts=0,
+            error=None,
+        )
+        profile = await asyncio.to_thread(load_profile_data, _profile_dir())
+        check_cancel()
+
+        if payload.approved_draft is not None:
+            approved_draft = payload.approved_draft
+            auto_compress_attempted = False
+            success = await compile_exact_draft(approved_draft, stage="compiling_approved_draft")
+            if not success and not compile_error and (last_page_count or 0) > 1:
+                auto_compress_attempted = True
+                compile_logs.append("Approved edit overflowed one page; attempting automatic compression retry.")
+                metadata = job_store.record_status(
+                    metadata,
+                    stage="compressing_approved_draft",
+                    compile_logs=compile_logs,
+                    error=None,
+                )
+                merged_edit_instructions = "\n\n".join(
+                    part for part in [
+                        (payload.edit_instructions or "").strip(),
+                        APPROVED_EDIT_ONE_PAGE_INSTRUCTIONS,
+                    ] if part
+                )
+                retry_payload = payload.model_copy(
+                    update={
+                        "approved_draft": None,
+                        "edit_instructions": merged_edit_instructions,
+                    }
+                )
+                compile_retry_feedback = (
+                    f"success=True, page_count={last_page_count}, "
+                    f"log={compile_logs[-2] if len(compile_logs) >= 2 else 'n/a'}"
+                )
+                approved_draft = await asyncio.to_thread(
+                    _resume_generator().generate_resume,
+                    profile,
+                    retry_payload,
+                    2,
+                    payload.approved_draft,
+                    None,
+                    compile_retry_feedback,
+                )
+                success = await compile_exact_draft(
+                    approved_draft,
+                    stage="compiling_approved_draft_retry",
+                )
+
+            if success and last_pdf_bytes:
+                finalize_approved_success(approved_draft)
+                return
+
+            if last_typst_source:
+                job_store.write_text_artifact(job_id, "resume.typ", last_typst_source)
+            if last_pdf_bytes:
+                job_store.write_binary_artifact(job_id, "resume.pdf", last_pdf_bytes)
+            error_msg = (
+                "Approved edit preview failed Typst compilation."
+                if compile_error
+                else (
+                    "Approved edit preview still did not fit on one page after an automatic compression retry. "
+                    "Edit it again and re-approve, or use Shrink to one page."
+                    if auto_compress_attempted
+                    else "Approved edit preview did not fit on one page. Edit it again and re-approve."
+                )
+            )
+            job_store.record_status(
+                metadata,
+                status="failed",
+                stage="failed",
+                page_count=last_page_count,
+                compile_logs=compile_logs,
+                pdf_url=f"/files/{job_id}/resume.pdf" if last_pdf_bytes else None,
+                typst_url=f"/files/{job_id}/resume.typ" if last_typst_source else None,
+                error=error_msg,
+                fit_summary=approved_draft.fit_summary,
+                keywords=approved_draft.keywords,
+            )
+            return
+
+        max_generator_attempts = max(1, settings.max_generator_retries)
+        max_scorer_attempts = max(1, settings.max_scorer_retries)
+        scorer_feedback: ResumeScoreReport | None = None
+
+        for attempt in range(1, max_generator_attempts + 1):
+            check_cancel()
+            metadata = job_store.record_status(
+                metadata,
+                stage=f"gen_attempt_{attempt}",
+                attempts=attempt,
+                compile_logs=compile_logs,
+                review_summary=scorer_feedback.summary if scorer_feedback else None,
+                quality_score=scorer_feedback.quality_score if scorer_feedback else None,
+                match_score=scorer_feedback.match_score if scorer_feedback else None,
+                score_band=scorer_feedback.score_band if scorer_feedback else None,
+                recommendations=scorer_feedback.recommendations if scorer_feedback else [],
+            )
+            draft = await asyncio.to_thread(
+                _resume_generator().generate_resume,
+                profile,
+                payload,
+                attempt,
+                draft,
+                scorer_feedback,
+                compile_feedback,
+            )
+            check_cancel()
+            last_typst_source = render_resume(profile.template, draft, profile.personalization)
+            metadata = job_store.record_status(
+                metadata,
+                stage=f"compile_attempt_{attempt}",
+                keywords=draft.keywords,
+                fit_summary=draft.fit_summary,
+            )
+
+            compile_result = await compiler_client.compile(last_typst_source)
+            check_cancel()
+            compile_feedback = (
+                f"success={compile_result.success}, "
+                f"page_count={compile_result.page_count}, "
+                f"log={compile_result.compile_log.strip() or 'n/a'}"
+            )
+            compile_logs.append(f"gen {attempt}: {compile_feedback}")
+            last_page_count = compile_result.page_count
+            last_pdf_bytes = (
+                base64.b64decode(compile_result.pdf_base64)
+                if compile_result.pdf_base64
+                else None
+            )
+
+            if not compile_result.success:
+                compile_error = True
+                metadata = job_store.record_status(
+                    metadata,
+                    compile_logs=compile_logs,
+                )
+                break  # syntax/compile error — compression retries won't help
+
+            if attempt <= max_scorer_attempts:
+                metadata = job_store.record_status(
+                    metadata,
+                    stage=f"scr_attempt_{attempt}",
+                    page_count=last_page_count,
+                )
+                scorer_feedback = await asyncio.to_thread(
+                    _resume_generator().score_resume,
+                    profile,
+                    payload,
+                    draft,
+                    attempt,
+                    attempt,
+                    compile_feedback,
+                )
+                last_score_report = scorer_feedback
+                persist_score_report(scorer_feedback)
+                compile_logs.append(
+                    f"scr {attempt}: quality={scorer_feedback.quality_score}, "
+                    f"match={scorer_feedback.match_score}, decision={scorer_feedback.decision}"
+                )
+                metadata = job_store.record_status(
+                    metadata,
+                    review_summary=scorer_feedback.summary,
+                    quality_score=scorer_feedback.quality_score,
+                    match_score=scorer_feedback.match_score,
+                    score_band=scorer_feedback.score_band,
+                    recommendations=scorer_feedback.recommendations,
+                    compile_logs=compile_logs,
+                )
+
+            if compile_result.page_count == 1 and last_pdf_bytes:
+                remember_best_candidate(draft, scorer_feedback)
+                if scorer_feedback is None or scorer_feedback.decision == "approve":
+                    finalize_success(draft, scorer_feedback)
+                    return
+
+        if best_candidate is not None:
+            final_draft = best_candidate["draft"]
+            final_report = best_candidate["report"]
+            final_typst = best_candidate["typst"]
+            final_pdf = best_candidate["pdf"]
+            final_page_count = best_candidate["page_count"]
+            if isinstance(final_draft, ResumeDraft) and isinstance(final_typst, str) and isinstance(final_pdf, bytes):
+                last_typst_source = final_typst
+                last_pdf_bytes = final_pdf
+                last_page_count = final_page_count if isinstance(final_page_count, int) else 1
+                finalize_success(final_draft, final_report if isinstance(final_report, ResumeScoreReport) else None)
+                return
+
+        if last_typst_source:
+            job_store.write_text_artifact(job_id, "resume.typ", last_typst_source)
+        if last_pdf_bytes:
+            job_store.write_binary_artifact(job_id, "resume.pdf", last_pdf_bytes)
+        persist_score_report(last_score_report)
+
+        error_msg = (
+            "Typst compilation failed — check the compile log for syntax errors."
+            if compile_error
+            else "Could not produce a strong one-page resume within the gen/scr retry limit."
+        )
+        job_store.record_status(
+            metadata,
+            status="failed",
+            stage="failed",
+            page_count=last_page_count,
+            compile_logs=compile_logs,
+            pdf_url=f"/files/{job_id}/resume.pdf" if last_pdf_bytes else None,
+            typst_url=f"/files/{job_id}/resume.typ" if last_typst_source else None,
+            error=error_msg,
+            fit_summary=draft.fit_summary if draft else None,
+            review_summary=last_score_report.summary if last_score_report else None,
+            quality_score=last_score_report.quality_score if last_score_report else None,
+            match_score=last_score_report.match_score if last_score_report else None,
+            score_band=last_score_report.score_band if last_score_report else None,
+            keywords=draft.keywords if draft else [],
+            recommendations=last_score_report.recommendations if last_score_report else [],
+        )
+    except asyncio.CancelledError:
+        if last_typst_source:
+            job_store.write_text_artifact(job_id, "resume.typ", last_typst_source)
+        if last_pdf_bytes:
+            job_store.write_binary_artifact(job_id, "resume.pdf", last_pdf_bytes)
+        persist_score_report(last_score_report)
+        _stop_metadata(
+            metadata,
+            error=stop_reason,
+            page_count=last_page_count,
+            compile_logs=compile_logs,
+            pdf_url=f"/files/{job_id}/resume.pdf" if last_pdf_bytes else metadata.pdf_url,
+            typst_url=f"/files/{job_id}/resume.typ" if last_typst_source else metadata.typst_url,
+        )
+        return
+    except Exception as exc:  # pragma: no cover - defensive path
+        if last_typst_source:
+            job_store.write_text_artifact(job_id, "resume.typ", last_typst_source)
+        if last_pdf_bytes:
+            job_store.write_binary_artifact(job_id, "resume.pdf", last_pdf_bytes)
+        persist_score_report(last_score_report)
+        job_store.record_status(
+            metadata,
+            status="failed",
+            stage="failed",
+            page_count=last_page_count,
+            compile_logs=compile_logs,
+            error=str(exc),
+            review_summary=last_score_report.summary if last_score_report else None,
+            quality_score=last_score_report.quality_score if last_score_report else None,
+            match_score=last_score_report.match_score if last_score_report else None,
+            score_band=last_score_report.score_band if last_score_report else None,
+            recommendations=last_score_report.recommendations if last_score_report else [],
+        )
+    finally:
+        control.task = None
+        job_controls.pop(job_id, None)

@@ -1,0 +1,12 @@
+{
+  "required_profile_phrase": "",
+  "required_profile_recommendation": "",
+  "forbidden_content_regex": "",
+  "forbidden_content_gap": "",
+  "forbidden_content_recommendation": "",
+  "fixed_education_typst": "",
+  "default_profile_text": "Software engineer with verified project experience across local-first tools, APIs, and structured automation.",
+  "extra_prompt_notes": "Prefer concise bullets that are easy to defend in an interview.",
+  "contact_header_typst": "",
+  "layout_density": "compact"
+}

@@ -1,0 +1,32 @@
+{
+  "languages": [
+    "Python",
+    "TypeScript",
+    "JavaScript",
+    "SQL"
+  ],
+  "backend": [
+    "FastAPI",
+    "REST APIs",
+    "Pydantic",
+    "Docker"
+  ],
+  "frontend": [
+    "React",
+    "Vite",
+    "HTML",
+    "CSS"
+  ],
+  "tools": [
+    "Git",
+    "Linux",
+    "Shell",
+    "CI basics"
+  ],
+  "practices": [
+    "Local-first design",
+    "Structured JSON",
+    "Documentation",
+    "Testing"
+  ]
+}
