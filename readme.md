@@ -100,6 +100,42 @@ The web UI intentionally does not display stored secret values. Edit `.env`, the
 docker compose restart api telegram-bot
 ```
 
+
+## Stateless VPS Deployment
+
+The `stateless-vps` branch adds a public-facing mode for simple input-output CV generation. In this mode the API accepts candidate data and a job description, calls the configured model, compiles Typst, and returns PDF bytes plus Typst source directly in the response. It does not create profiles, jobs, or output files on the API service.
+
+Recommended architecture:
+
+- Run `frontend`, `api`, and `typst-compiler` with `docker-compose.stateless.yml`.
+- Put the VPS behind HTTPS with Caddy, Nginx, Cloudflare Tunnel, or another reverse proxy.
+- Set `STATELESS_ONLY=true` so profile/job persistence endpoints return 404.
+- Keep `FLASH_API_KEY` only in `.env` on the VPS.
+- Add reverse-proxy request size limits, rate limits, and access logs without request bodies.
+
+Minimal `.env` for Gemini Flash:
+
+```env
+FLASH_API_KEY=your-google-ai-studio-key
+STATELESS_ONLY=true
+STATELESS_LLM_PROVIDER=gemini
+STATELESS_MODEL_NAME=gemini-2.5-flash
+STATELESS_BASE_URL=https://generativelanguage.googleapis.com/v1beta/openai
+STATELESS_ENABLE_DEMO_MODE=false
+FRONTEND_PORT=3000
+API_PORT=8000
+```
+
+Run locally or on the VPS:
+
+```bash
+docker compose -f docker-compose.stateless.yml up --build -d
+```
+
+The stateless compose file does not mount `data/` or `outputs/` into the API container. The API container is read-only and uses `tmpfs` for `/tmp`; the compiler also uses `tmpfs`. Generated PDFs are returned to the browser instead of written to `outputs/`.
+
+For production, prefer exposing only the frontend through HTTPS and keeping the API reachable only from the reverse proxy or private network. Even stateless CV generation still handles private text in memory, so do not log request bodies.
+
 ## Telegram Bot Setup
 
 The Telegram bot is optional. It talks to the API service inside Docker and uses the active profile selected in the web UI. Configure the web profile first, then start the bot.

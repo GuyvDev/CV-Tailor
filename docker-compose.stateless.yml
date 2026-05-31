@@ -1,0 +1,77 @@
+services:
+  frontend:
+    restart: unless-stopped
+    build:
+      context: ./frontend
+      args:
+        VITE_API_BASE_URL: ${VITE_API_BASE_URL:-}
+        VITE_STATELESS_ONLY: "true"
+    ports:
+      - "${FRONTEND_PORT:-3000}:80"
+    depends_on:
+      api:
+        condition: service_healthy
+
+  api:
+    restart: unless-stopped
+    build:
+      context: ./api
+    environment:
+      STATELESS_ONLY: "true"
+      STATELESS_LLM_PROVIDER: ${STATELESS_LLM_PROVIDER:-gemini}
+      STATELESS_MODEL_NAME: ${STATELESS_MODEL_NAME:-gemini-2.5-flash}
+      STATELESS_BASE_URL: ${STATELESS_BASE_URL:-https://generativelanguage.googleapis.com/v1beta/openai}
+      STATELESS_REASONING_EFFORT: ${STATELESS_REASONING_EFFORT:-medium}
+      STATELESS_ENABLE_DEMO_MODE: ${STATELESS_ENABLE_DEMO_MODE:-false}
+      FLASH_API_KEY: ${FLASH_API_KEY:-}
+      COMPILER_URL: http://typst-compiler:8001
+      OUTPUT_DIR: /tmp/cv-outputs
+      PROFILE_DIR: /tmp/cv-profile
+      MAX_GENERATOR_RETRIES: ${MAX_GENERATOR_RETRIES:-2}
+      MAX_SCORER_RETRIES: ${MAX_SCORER_RETRIES:-2}
+    ports:
+      - "${API_PORT:-8000}:8000"
+    tmpfs:
+      - /tmp:size=256m,mode=1777
+    read_only: true
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=5)",
+        ]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    depends_on:
+      typst-compiler:
+        condition: service_healthy
+
+  typst-compiler:
+    restart: unless-stopped
+    build:
+      context: ./compiler
+    environment:
+      TMP_DIR: /tmp/typst
+    tmpfs:
+      - /tmp:size=256m,mode=1777
+    read_only: true
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8001/health', timeout=5)",
+        ]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+networks:
+  default:
+    driver: bridge

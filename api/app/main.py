@@ -13,12 +13,13 @@ from dataclasses import dataclass, field
 from uuid import uuid4
 from pathlib import Path
 
-from fastapi import BackgroundTasks, FastAPI, HTTPException, status
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+from starlette.responses import JSONResponse
 
 from app.config import get_settings
-from app.data_loader import load_profile_data
+from app.data_loader import PersonalizationSettings, ProfileData, load_profile_data
 from app.models import (
     AiProfileDraftRequest,
     AiProfileDraftResponse,
@@ -38,6 +39,8 @@ from app.models import (
     ScoreResumeRequest,
     SwitchProfileRequest,
     ScoreResumeResponse,
+    StatelessGenerateRequest,
+    StatelessGenerateResponse,
 )
 from app.review_schema import ResumeScoreReport
 from app.renderer import render_resume
@@ -51,6 +54,14 @@ settings = get_settings()
 job_store = JobStore(settings.output_dir)
 compiler_client = CompilerClient(settings.compiler_url)
 TERMINAL_STATUSES = {"completed", "failed", "stopped"}
+
+
+def _stateless_only() -> bool:
+    return os.getenv("STATELESS_ONLY", "false").strip().lower() in {"1", "true", "yes", "on"}
+
+
+STATELESS_ALLOWED_PREFIXES = ("/api/stateless", "/api/health", "/docs", "/redoc", "/openapi.json")
+
 
 PROFILE_FILES = {
     "master_profile": "master_profile.md",
@@ -222,6 +233,149 @@ def _resume_generator() -> ResumeGenerator:
 
 def _output_basename() -> str:
     return _safe_part(str(_read_app_settings_secret().get("output_basename") or "tailored-resume"), max_len=80)
+
+
+def _default_stateless_template() -> str:
+    return '#set page(\n  paper: "us-letter",\n  margin: (x: 2.54cm, y: 2.00cm),\n)\n\n#set text(font: "DejaVu Sans", size: 10pt, fill: black)\n#set par(leading: 0.5em, justify: true, spacing: 0pt)\n#set block(spacing: 6pt)\n\n#let theme-blue = rgb("#00508C")\n\n#let section(title) = {\n  stack(\n    dir: ttb,\n    spacing: 1pt,\n    text(fill: theme-blue, weight: "bold", size: 11pt)[#upper(title)],\n    line(length: 100%, stroke: 0.5pt + theme-blue),\n  )\n  v(4pt)\n}\n\n#let project(title) = {\n  v(4pt)\n  text(fill: theme-blue, weight: "bold")[#title]\n}\n\n#let bullet(content) = {\n  grid(\n    columns: (12pt, 1fr),\n    gutter: 0pt,\n    align: (right, left),\n    [•#h(4pt)],\n    content\n  )\n}\n\n// Header\n{{CONTACT_HEADER}}\n\n#v(8pt)\n\n{{PROFILE_SECTION}}\n\n{{BODY_CONTENT}}\n'
+
+
+def _stateless_template(payload: StatelessGenerateRequest) -> str:
+    if payload.template_typst.strip():
+        return payload.template_typst
+    template_path = settings.profile_dir.parent / "profile.example" / "templates" / "base_resume.typ"
+    if not template_path.exists():
+        template_path = Path(__file__).parents[2] / "data" / "profile.example" / "templates" / "base_resume.typ"
+    if template_path.exists():
+        return template_path.read_text(encoding="utf-8")
+    return _default_stateless_template()
+
+
+def _stateless_profile(payload: StatelessGenerateRequest) -> ProfileData:
+    try:
+        projects = json.loads(payload.projects_json or "[]")
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=422, detail=f"projects_json is invalid JSON: {exc.msg}") from exc
+    try:
+        skills = json.loads(payload.skills_json or "{}")
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=422, detail=f"skills_json is invalid JSON: {exc.msg}") from exc
+    if not isinstance(projects, list):
+        raise HTTPException(status_code=422, detail="projects_json must be a JSON array.")
+    if not isinstance(skills, dict):
+        raise HTTPException(status_code=422, detail="skills_json must be a JSON object.")
+
+    return ProfileData(
+        master_profile=payload.candidate_profile,
+        projects=[project for project in projects if str(project.get("cv_status", "active")).lower() not in {"hold", "on_hold", "paused"}],
+        skills={str(key): [str(item) for item in value] for key, value in skills.items() if isinstance(value, list)},
+        rules=payload.rules,
+        cv_guidance=payload.research_guidelines,
+        template=_stateless_template(payload),
+        examples={},
+        style_references=[],
+        personalization=PersonalizationSettings.from_dict(payload.personalization.model_dump()),
+    )
+
+
+def _stateless_generator() -> ResumeGenerator:
+    flash_key = os.getenv("FLASH_API_KEY", "").strip()
+    provider = os.getenv("STATELESS_LLM_PROVIDER", "gemini").strip().lower()
+    model_name = os.getenv("STATELESS_MODEL_NAME", "gemini-2.5-flash").strip()
+    base_url = os.getenv("STATELESS_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai").rstrip("/")
+    enable_demo = os.getenv("STATELESS_ENABLE_DEMO_MODE", "false").strip().lower() in {"1", "true", "yes", "on"}
+    if provider == "gemini":
+        return ResumeGenerator(
+            provider="abacus",
+            api_key=None,
+            abacus_api_key=flash_key or None,
+            abacus_base_url=base_url,
+            model_name=model_name,
+            reasoning_effort=os.getenv("STATELESS_REASONING_EFFORT", "medium"),
+            enable_demo_mode=enable_demo,
+        )
+    return ResumeGenerator(
+        provider=provider,
+        api_key=os.getenv("OPENAI_API_KEY") or None,
+        abacus_api_key=os.getenv("ABACUS_API_KEY") or None,
+        abacus_base_url=os.getenv("ABACUS_BASE_URL", "https://routellm.abacus.ai/v1").rstrip("/"),
+        model_name=model_name,
+        reasoning_effort=os.getenv("STATELESS_REASONING_EFFORT", settings.reasoning_effort),
+        enable_demo_mode=enable_demo,
+    )
+
+
+def _run_stateless_generation(payload: StatelessGenerateRequest) -> StatelessGenerateResponse:
+    profile = _stateless_profile(payload)
+    generator = _stateless_generator()
+    request = GenerateRequest(
+        job_description=payload.job_description,
+        role_focus=payload.role_focus,
+        template="stateless",
+        label="stateless",
+    )
+    attempts = max(1, min(settings.max_generator_retries, 3))
+    scorer_attempts = max(1, min(settings.max_scorer_retries, attempts))
+    previous_draft: ResumeDraft | None = None
+    scorer_feedback: ResumeScoreReport | None = None
+    compile_feedback: str | None = None
+    compile_logs: list[str] = []
+    last_source = ""
+    last_pdf = ""
+    last_page_count = 0
+    last_draft: ResumeDraft | None = None
+
+    for attempt in range(1, attempts + 1):
+        draft = generator.generate_resume(
+            profile,
+            request,
+            attempt,
+            previous_draft,
+            scorer_feedback,
+            compile_feedback,
+        )
+        last_draft = draft
+        last_source = render_resume(profile.template, draft, profile.personalization)
+        compile_result = asyncio.run(compiler_client.compile(last_source))
+        compile_feedback = (
+            f"success={compile_result.success}, "
+            f"page_count={compile_result.page_count}, "
+            f"log={compile_result.compile_log.strip() or 'n/a'}"
+        )
+        compile_logs.append(f"gen {attempt}: {compile_feedback}")
+        last_page_count = compile_result.page_count or 0
+        last_pdf = compile_result.pdf_base64 or ""
+        if not compile_result.success or not last_pdf:
+            raise HTTPException(status_code=502, detail=f"Typst compilation failed: {compile_result.compile_log[:800]}")
+
+        if attempt <= scorer_attempts:
+            scorer_feedback = generator.score_resume(
+                profile,
+                request,
+                draft,
+                attempt,
+                attempt,
+                compile_feedback,
+            )
+            compile_logs.append(
+                f"scr {attempt}: quality={scorer_feedback.quality_score}, "
+                f"match={scorer_feedback.match_score}, decision={scorer_feedback.decision}"
+            )
+            if scorer_feedback.decision == "approve" and last_page_count == 1:
+                break
+        previous_draft = draft
+
+    if last_draft is None or not last_pdf:
+        raise HTTPException(status_code=500, detail="Stateless generation produced no output.")
+    return StatelessGenerateResponse(
+        pdf_base64=last_pdf,
+        typst_source=last_source,
+        page_count=last_page_count,
+        draft=last_draft,
+        score_report=scorer_feedback,
+        compile_logs=compile_logs,
+        output_basename=_safe_part(payload.output_basename or "tailored-resume", max_len=80),
+        model_name=generator.model_name,
+    )
 
 
 def _profile_draft_schema() -> dict:
@@ -473,7 +627,17 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-app.mount("/files", StaticFiles(directory=settings.output_dir), name="files")
+
+
+@app.middleware("http")
+async def stateless_only_guard(request: Request, call_next):
+    if _stateless_only() and request.url.path.startswith("/api/") and not request.url.path.startswith(STATELESS_ALLOWED_PREFIXES):
+        return JSONResponse({"detail": "This deployment is running in stateless-only mode."}, status_code=404)
+    return await call_next(request)
+
+
+if not _stateless_only():
+    app.mount("/files", StaticFiles(directory=settings.output_dir), name="files")
 
 
 @app.get("/api/config", response_model=RuntimeConfigResponse)
@@ -609,8 +773,14 @@ async def save_profile(payload: SaveProfileBundleRequest) -> ProfileBundle:
 
 @app.get("/api/health")
 async def healthcheck() -> dict[str, str]:
-    mode = "live" if _resume_generator().has_live_model() else "demo"
+    generator = _stateless_generator() if _stateless_only() else _resume_generator()
+    mode = "live" if generator.has_live_model() else "demo"
     return {"status": "ok", "mode": mode}
+
+
+@app.post("/api/stateless/generate", response_model=StatelessGenerateResponse)
+async def stateless_generate(payload: StatelessGenerateRequest) -> StatelessGenerateResponse:
+    return await asyncio.to_thread(_run_stateless_generation, payload)
 
 
 @app.post("/api/generate", response_model=GenerateResponse, status_code=202)

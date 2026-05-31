@@ -87,6 +87,29 @@ type DraftResponse = {
   profile: ProfileBundle;
 };
 
+type ScoreReport = {
+  quality_score: number;
+  match_score: number;
+  score_band: string;
+  decision: string;
+  summary: string;
+  strengths: string[];
+  gaps: string[];
+  recommendations: string[];
+  revision_brief: string;
+};
+
+type StatelessGenerateResponse = {
+  pdf_base64: string;
+  typst_source: string;
+  page_count: number;
+  draft: unknown;
+  score_report?: ScoreReport | null;
+  compile_logs: string[];
+  output_basename: string;
+  model_name: string;
+};
+
 const telegramSetupPrompt = `I am configuring a local Docker CV tailoring app with an optional Telegram bot. Guide me step by step. Ask me for my BotFather token, my numeric Telegram user id, and whether I run Docker Compose locally or on a server. Then help me set TELEGRAM_BOT_TOKEN, TELEGRAM_ALLOWED_USER_IDS, and API_URL=http://api:8000 in .env, restart docker compose, verify the bot responds, and explain how to rotate the token if I accidentally expose it. Do not ask me to paste secrets into a public chat.`;
 
 function generationProgress(job: JobMetadata | null): number {
@@ -113,6 +136,7 @@ function progressLabel(job: JobMetadata | null): string {
 }
 
 const apiBaseUrl = import.meta.env.VITE_API_BASE_URL || "";
+const statelessOnly = import.meta.env.VITE_STATELESS_ONLY === "true";
 
 const roleOptions = [
   { label: "General", value: "" },
@@ -161,7 +185,7 @@ const emptyProfile: ProfileBundle = {
 };
 
 export function App() {
-  const [activeView, setActiveView] = useState<"generate" | "personalize">("generate");
+  const [activeView, setActiveView] = useState<"generate" | "stateless" | "personalize">(statelessOnly ? "stateless" : "generate");
   const [jobDescription, setJobDescription] = useState("");
   const [roleFocus, setRoleFocus] = useState("");
   const [isSubmitting, setIsSubmitting] = useState(false);
@@ -182,6 +206,16 @@ export function App() {
   const [setupInput, setSetupInput] = useState("");
   const [draftSummary, setDraftSummary] = useState<string | null>(null);
   const [isDraftingProfile, setIsDraftingProfile] = useState(false);
+  const [statelessCandidate, setStatelessCandidate] = useState("");
+  const [statelessProjects, setStatelessProjects] = useState("[]");
+  const [statelessSkills, setStatelessSkills] = useState("{}");
+  const [statelessRules, setStatelessRules] = useState("Keep every bullet factual and grounded in the candidate input. Do not invent employers, metrics, dates, degrees, or tools.");
+  const [statelessJob, setStatelessJob] = useState("");
+  const [statelessRoleFocus, setStatelessRoleFocus] = useState("");
+  const [statelessOutputName, setStatelessOutputName] = useState("tailored-resume");
+  const [statelessResult, setStatelessResult] = useState<StatelessGenerateResponse | null>(null);
+  const [statelessError, setStatelessError] = useState<string | null>(null);
+  const [isGeneratingStateless, setIsGeneratingStateless] = useState(false);
 
   function resetJob() {
     setJob(null);
@@ -442,6 +476,58 @@ export function App() {
     });
   }
 
+  function downloadBase64File(filename: string, base64: string, mimeType: string) {
+    const bytes = Uint8Array.from(atob(base64), (char) => char.charCodeAt(0));
+    const url = URL.createObjectURL(new Blob([bytes], { type: mimeType }));
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = filename;
+    link.click();
+    URL.revokeObjectURL(url);
+  }
+
+  function downloadTextFile(filename: string, content: string) {
+    const url = URL.createObjectURL(new Blob([content], { type: "text/plain;charset=utf-8" }));
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = filename;
+    link.click();
+    URL.revokeObjectURL(url);
+  }
+
+  async function generateStateless(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setIsGeneratingStateless(true);
+    setStatelessError(null);
+    setStatelessResult(null);
+    try {
+      const response = await fetch(`${apiBaseUrl}/api/stateless/generate`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          candidate_profile: statelessCandidate,
+          job_description: statelessJob,
+          projects_json: statelessProjects || "[]",
+          skills_json: statelessSkills || "{}",
+          role_focus: statelessRoleFocus || null,
+          rules: statelessRules,
+          research_guidelines: "Score for role fit, factual grounding, one-page density, ATS-readable wording, and recruiter scan clarity.",
+          personalization: { ...emptyPersonalization, layout_density: "compact" },
+          output_basename: statelessOutputName || "tailored-resume",
+        }),
+      });
+      if (!response.ok) {
+        const payload = await response.json().catch(() => null);
+        throw new Error(payload?.detail || "Stateless generation failed.");
+      }
+      setStatelessResult(await response.json());
+    } catch (generateError) {
+      setStatelessError(generateError instanceof Error ? generateError.message : "Unknown stateless generation error.");
+    } finally {
+      setIsGeneratingStateless(false);
+    }
+  }
+
   const progress = generationProgress(job);
   const currentProfile = profiles.find((item) => item.profile_id === profile.profile_id);
 
@@ -457,8 +543,9 @@ export function App() {
       </section>
 
       <nav className="tabs" aria-label="Workspace views">
-        <button className={activeView === "generate" ? "tab active" : "tab"} type="button" onClick={() => setActiveView("generate")}>Generate</button>
-        <button className={activeView === "personalize" ? "tab active" : "tab"} type="button" onClick={() => setActiveView("personalize")}>Personalize</button>
+        {!statelessOnly ? <button className={activeView === "generate" ? "tab active" : "tab"} type="button" onClick={() => setActiveView("generate")}>Generate</button> : null}
+        <button className={activeView === "stateless" ? "tab active" : "tab"} type="button" onClick={() => setActiveView("stateless")}>Stateless</button>
+        {!statelessOnly ? <button className={activeView === "personalize" ? "tab active" : "tab"} type="button" onClick={() => setActiveView("personalize")}>Personalize</button> : null}
       </nav>
 
       {activeView === "generate" ? (
@@ -559,6 +646,90 @@ export function App() {
                     <pre>{job.compile_logs.join("\n\n")}</pre>
                   </div>
                 ) : null}
+              </div>
+            ) : null}
+          </section>
+        </>
+      ) : activeView === "stateless" ? (
+        <>
+          <section className="panel">
+            <form className="form" onSubmit={generateStateless}>
+              <div className="notice">
+                Stateless mode does not create profiles, jobs, or output files on the API service. The server returns PDF bytes and Typst source directly to this browser session.
+              </div>
+              <div className="settings-grid">
+                <label className="field">
+                  <span>Role focus</span>
+                  <select value={statelessRoleFocus} onChange={(event) => setStatelessRoleFocus(event.target.value)}>
+                    {roleOptions.map((option) => (
+                      <option key={option.value} value={option.value}>{option.label}</option>
+                    ))}
+                  </select>
+                </label>
+                <label className="field">
+                  <span>Output name</span>
+                  <input value={statelessOutputName} onChange={(event) => setStatelessOutputName(event.target.value)} />
+                </label>
+              </div>
+              <label className="field">
+                <span>Candidate CV data</span>
+                <textarea value={statelessCandidate} onChange={(event) => setStatelessCandidate(event.target.value)} rows={12} placeholder={`Paste candidate facts in this shape:
+# Candidate Profile
+
+## Contact
+* Name: ...
+* Email: ...
+
+## Summary Facts
+* ...
+
+## Education
+* School
+* Degree
+* Dates`} required />
+              </label>
+              <label className="field">
+                <span>Projects JSON</span>
+                <textarea className="mono" value={statelessProjects} onChange={(event) => setStatelessProjects(event.target.value)} rows={8} />
+              </label>
+              <label className="field">
+                <span>Skills JSON</span>
+                <textarea className="mono" value={statelessSkills} onChange={(event) => setStatelessSkills(event.target.value)} rows={6} />
+              </label>
+              <label className="field">
+                <span>Generation rules</span>
+                <textarea value={statelessRules} onChange={(event) => setStatelessRules(event.target.value)} rows={4} />
+              </label>
+              <label className="field">
+                <span>Job description</span>
+                <textarea value={statelessJob} onChange={(event) => setStatelessJob(event.target.value)} rows={10} required />
+              </label>
+              <button disabled={isGeneratingStateless || statelessCandidate.trim().length < 20 || statelessJob.trim().length < 20} type="submit">
+                {isGeneratingStateless ? "Generating..." : "Generate stateless PDF"}
+              </button>
+            </form>
+          </section>
+
+          <section className="panel result">
+            <div className="result-header">
+              <h2>Stateless result</h2>
+              {statelessResult ? <span className="badge badge-completed">{statelessResult.model_name}</span> : null}
+            </div>
+            {statelessError ? <p className="error">{statelessError}</p> : null}
+            {!statelessResult && !statelessError ? <p className="muted">No stateless CV generated yet.</p> : null}
+            {statelessResult ? (
+              <div className="result-body">
+                <p><strong>Page count:</strong> {statelessResult.page_count}</p>
+                {statelessResult.score_report ? (
+                  <p><strong>Score:</strong> Quality {statelessResult.score_report.quality_score}/100 | Match {statelessResult.score_report.match_score}/100 | {statelessResult.score_report.score_band}</p>
+                ) : null}
+                {statelessResult.score_report?.summary ? <p><strong>Review:</strong> {statelessResult.score_report.summary}</p> : null}
+                <div className="downloads">
+                  <button className="small-button" type="button" onClick={() => downloadBase64File(`${statelessResult.output_basename}.pdf`, statelessResult.pdf_base64, "application/pdf")}>Download PDF</button>
+                  <button className="small-button" type="button" onClick={() => downloadTextFile(`${statelessResult.output_basename}.typ`, statelessResult.typst_source)}>Download Typst</button>
+                  <a href="https://typst.app/play/" rel="noreferrer" target="_blank">Open Typst playground</a>
+                </div>
+                {statelessResult.compile_logs.length > 0 ? <pre className="inline-log">{statelessResult.compile_logs.join("\n")}</pre> : null}
               </div>
             ) : null}
           </section>

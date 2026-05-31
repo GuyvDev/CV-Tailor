@@ -491,3 +491,14 @@ button:not(:disabled):hover {
     align-items: stretch;
   }
 }
+
+.inline-log {
+  margin: 8px 0 0;
+  border-radius: 8px;
+  padding: 12px;
+  overflow-x: auto;
+  background: rgba(34, 28, 20, 0.94);
+  color: #f8eee1;
+  font-family: "IBM Plex Mono", "SFMono-Regular", monospace;
+  font-size: 0.84rem;
+}

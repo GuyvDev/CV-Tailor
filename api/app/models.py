@@ -167,6 +167,30 @@ class AiProfileDraftResponse(BaseModel):
     profile: ProfileBundle
 
 
+class StatelessGenerateRequest(BaseModel):
+    candidate_profile: str = Field(min_length=20)
+    job_description: str = Field(min_length=20)
+    projects_json: str = "[]"
+    skills_json: str = "{}"
+    role_focus: str | None = None
+    rules: str = ""
+    research_guidelines: str = ""
+    personalization: PersonalizationOptions = Field(default_factory=PersonalizationOptions)
+    output_basename: str = "tailored-resume"
+    template_typst: str = ""
+
+
+class StatelessGenerateResponse(BaseModel):
+    pdf_base64: str
+    typst_source: str
+    page_count: int
+    draft: ResumeDraft
+    score_report: ResumeScoreReport | None = None
+    compile_logs: list[str] = Field(default_factory=list)
+    output_basename: str = "tailored-resume"
+    model_name: str
+
+
 class RuntimeConfigResponse(BaseModel):
     llm_provider: str
     model_name: str
