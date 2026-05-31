@@ -101,6 +101,33 @@ docker compose restart api telegram-bot
 ```
 
 
+
+## Vercel Hobby Deployment
+
+The generated one-page PDFs from the Gemini/GPT comparison were about 32 KB, far below Vercel's 4.5 MB function payload limit for normal CV output. The `stateless-vps` branch now also supports a Vercel deployment path.
+
+Deploy from the `frontend/` directory as the Vercel project root. The frontend contains:
+
+- `api/stateless/generate.ts` - Vercel Function for Gemini Flash generation and Typst PDF compilation.
+- `vercel.json` - 300 second function duration and 2 GB memory configuration.
+
+Set these Vercel environment variables:
+
+```env
+FLASH_API_KEY=your-google-ai-studio-key
+STATELESS_MODEL_NAME=gemini-2.5-flash
+VITE_STATELESS_ONLY=true
+```
+
+Recommended Vercel settings:
+
+- Root Directory: `frontend`
+- Build Command: `npm run build`
+- Output Directory: `dist`
+- Install Command: `npm install`
+
+The Vercel path is fully stateless: the function returns the PDF and Typst source in the JSON response and does not create profiles, jobs, or output files. Keep request-body logging disabled and add rate limiting/abuse protection before sharing the URL widely.
+
 ## Stateless VPS Deployment
 
 The `stateless-vps` branch adds a public-facing mode for simple input-output CV generation. In this mode the API accepts candidate data and a job description, calls the configured model, compiles Typst, and returns PDF bytes plus Typst source directly in the response. It does not create profiles, jobs, or output files on the API service.

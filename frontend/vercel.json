@@ -1,0 +1,18 @@
+{
+  "functions": {
+    "api/**/*.ts": {
+      "maxDuration": 300,
+      "memory": 2048
+    }
+  },
+  "rewrites": [
+    {
+      "source": "/api/(.*)",
+      "destination": "/api/$1"
+    },
+    {
+      "source": "/(.*)",
+      "destination": "/index.html"
+    }
+  ]
+}
