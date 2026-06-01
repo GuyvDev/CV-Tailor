@@ -112,6 +112,38 @@ type StatelessGenerateResponse = {
 
 const telegramSetupPrompt = `I am configuring a local Docker CV tailoring app with an optional Telegram bot. Guide me step by step. Ask me for my BotFather token, my numeric Telegram user id, and whether I run Docker Compose locally or on a server. Then help me set TELEGRAM_BOT_TOKEN, TELEGRAM_ALLOWED_USER_IDS, and API_URL=http://api:8000 in .env, restart docker compose, verify the bot responds, and explain how to rotate the token if I accidentally expose it. Do not ask me to paste secrets into a public chat.`;
 
+const cvDataPreparationPrompt = `You are helping me prepare structured private CV data for a stateless CV tailoring tool. I will paste my resume, LinkedIn text, project notes, portfolio notes, education, skills, and preferences.
+
+Your job: extract only verified facts from my text and return one JSON object. Do not invent employers, dates, degrees, awards, links, metrics, tools, or results. If something is unclear, omit it or put it in notes_for_review.
+
+Return exactly this JSON shape:
+{
+  "candidate_profile": "# Candidate Profile\n\n## Contact\n* Name: ...\n* Email: ...\n* Location: ...\n* LinkedIn: ...\n* GitHub: ...\n\n## Summary Facts\n* ...\n\n## Education\n* School\n* Degree\n* Dates\n* Coursework, honors, or relevant notes",
+  "projects_json": [
+    {
+      "title": "Project name",
+      "dates": "YYYY or date range",
+      "stack": ["Tool", "Language", "Framework"],
+      "cv_status": "active",
+      "facts": [
+        "Verified project fact with action and technical detail",
+        "Verified project fact with method, tool, or constraint",
+        "Verified project fact with outcome only if explicitly provided"
+      ]
+    }
+  ],
+  "skills_json": {
+    "Languages": ["..."],
+    "Frameworks": ["..."],
+    "Tools": ["..."],
+    "Practices": ["..."]
+  },
+  "rules": "Short factual writing preferences for CV generation. Include constraints such as no invented metrics, preferred role targets, words to avoid, or required phrases.",
+  "notes_for_review": ["Anything uncertain that I should verify before using this data"]
+}
+
+Make the output valid JSON only. No markdown fences. No explanation outside the JSON.`;
+
 function generationProgress(job: JobMetadata | null): number {
   if (!job) return 0;
   if (job.status === "completed") return 100;
@@ -206,6 +238,8 @@ export function App() {
   const [setupInput, setSetupInput] = useState("");
   const [draftSummary, setDraftSummary] = useState<string | null>(null);
   const [isDraftingProfile, setIsDraftingProfile] = useState(false);
+  const [statelessPreparedJson, setStatelessPreparedJson] = useState("");
+  const [statelessPreparedStatus, setStatelessPreparedStatus] = useState<string | null>(null);
   const [statelessCandidate, setStatelessCandidate] = useState("");
   const [statelessProjects, setStatelessProjects] = useState("[]");
   const [statelessSkills, setStatelessSkills] = useState("{}");
@@ -495,6 +529,23 @@ export function App() {
     URL.revokeObjectURL(url);
   }
 
+  function loadPreparedCvData() {
+    setStatelessError(null);
+    setStatelessPreparedStatus(null);
+    try {
+      const payload = JSON.parse(statelessPreparedJson);
+      const projects = Array.isArray(payload.projects_json) ? JSON.stringify(payload.projects_json, null, 2) : String(payload.projects_json || "[]");
+      const skills = typeof payload.skills_json === "object" && payload.skills_json !== null ? JSON.stringify(payload.skills_json, null, 2) : String(payload.skills_json || "{}");
+      setStatelessCandidate(String(payload.candidate_profile || ""));
+      setStatelessProjects(projects);
+      setStatelessSkills(skills);
+      setStatelessRules(String(payload.rules || "Keep every bullet factual and grounded in the candidate input. Do not invent employers, metrics, dates, degrees, or tools."));
+      setStatelessPreparedStatus("Prepared CV data loaded. Review it below, then paste a job description and generate.");
+    } catch (parseError) {
+      setStatelessError(parseError instanceof Error ? `Prepared JSON is invalid: ${parseError.message}` : "Prepared JSON is invalid.");
+    }
+  }
+
   async function generateStateless(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     setIsGeneratingStateless(true);
@@ -653,9 +704,44 @@ export function App() {
       ) : activeView === "stateless" ? (
         <>
           <section className="panel">
+            <div className="form">
+              <div className="notice privacy-note">
+                <strong>Privacy shape:</strong> this hosted stateless demo only uses the CV data you paste for this one generation. It does not create server-side profiles, job history, or output files. For stronger privacy, the GitHub project can run locally with your profile stored on your own machine, and it includes Telegram bot integration for a private local-bot workflow without publishing a web UI to the internet.
+              </div>
+
+              <div className="subsection prompt-helper">
+                <div className="result-header">
+                  <h3>1. Prepare Your CV Data With Your AI</h3>
+                  <button className="small-button" type="button" onClick={() => navigator.clipboard.writeText(cvDataPreparationPrompt)}>Copy prompt</button>
+                </div>
+                <label className="field">
+                  <span>Prompt to paste into ChatGPT, Gemini, Claude, or another AI</span>
+                  <textarea className="mono" readOnly rows={12} value={cvDataPreparationPrompt} />
+                </label>
+              </div>
+
+              <div className="subsection">
+                <h3>2. Paste The AI Output</h3>
+                <label className="field">
+                  <span>Prepared CV data JSON</span>
+                  <textarea
+                    className="mono"
+                    value={statelessPreparedJson}
+                    onChange={(event) => setStatelessPreparedJson(event.target.value)}
+                    rows={12}
+                    placeholder="Paste the JSON returned by your AI here. It should include candidate_profile, projects_json, skills_json, and rules."
+                  />
+                </label>
+                <button className="small-button" disabled={statelessPreparedJson.trim().length < 20} type="button" onClick={loadPreparedCvData}>Load prepared data</button>
+                {statelessPreparedStatus ? <p className="success">{statelessPreparedStatus}</p> : null}
+              </div>
+            </div>
+          </section>
+
+          <section className="panel">
             <form className="form" onSubmit={generateStateless}>
-              <div className="notice">
-                Stateless mode does not create profiles, jobs, or output files on the API service. The server returns PDF bytes and Typst source directly to this browser session.
+              <div className="result-header">
+                <h2>3. Generate A Tailored CV</h2>
               </div>
               <div className="settings-grid">
                 <label className="field">
@@ -672,34 +758,24 @@ export function App() {
                 </label>
               </div>
               <label className="field">
-                <span>Candidate CV data</span>
-                <textarea value={statelessCandidate} onChange={(event) => setStatelessCandidate(event.target.value)} rows={12} placeholder={`Paste candidate facts in this shape:
-# Candidate Profile
-
-## Contact
-* Name: ...
-* Email: ...
-
-## Summary Facts
-* ...
-
-## Education
-* School
-* Degree
-* Dates`} required />
+                <span>Candidate profile loaded from prepared JSON</span>
+                <textarea value={statelessCandidate} onChange={(event) => setStatelessCandidate(event.target.value)} rows={9} required />
               </label>
-              <label className="field">
-                <span>Projects JSON</span>
-                <textarea className="mono" value={statelessProjects} onChange={(event) => setStatelessProjects(event.target.value)} rows={8} />
-              </label>
-              <label className="field">
-                <span>Skills JSON</span>
-                <textarea className="mono" value={statelessSkills} onChange={(event) => setStatelessSkills(event.target.value)} rows={6} />
-              </label>
-              <label className="field">
-                <span>Generation rules</span>
-                <textarea value={statelessRules} onChange={(event) => setStatelessRules(event.target.value)} rows={4} />
-              </label>
+              <details className="advanced-block">
+                <summary>Review structured data</summary>
+                <label className="field">
+                  <span>Projects JSON</span>
+                  <textarea className="mono" value={statelessProjects} onChange={(event) => setStatelessProjects(event.target.value)} rows={8} />
+                </label>
+                <label className="field">
+                  <span>Skills JSON</span>
+                  <textarea className="mono" value={statelessSkills} onChange={(event) => setStatelessSkills(event.target.value)} rows={6} />
+                </label>
+                <label className="field">
+                  <span>Generation rules</span>
+                  <textarea value={statelessRules} onChange={(event) => setStatelessRules(event.target.value)} rows={4} />
+                </label>
+              </details>
               <label className="field">
                 <span>Job description</span>
                 <textarea value={statelessJob} onChange={(event) => setStatelessJob(event.target.value)} rows={10} required />

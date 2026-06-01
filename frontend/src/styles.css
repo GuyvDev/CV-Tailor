@@ -502,3 +502,30 @@ button:not(:disabled):hover {
   font-family: "IBM Plex Mono", "SFMono-Regular", monospace;
   font-size: 0.84rem;
 }
+
+.privacy-note strong {
+  color: var(--accent-strong);
+}
+
+.prompt-helper textarea {
+  min-height: 260px;
+}
+
+.advanced-block {
+  display: grid;
+  gap: 14px;
+  border: 1px solid var(--panel-border);
+  border-radius: 8px;
+  padding: 12px;
+  background: rgba(255, 255, 255, 0.62);
+}
+
+.advanced-block summary {
+  cursor: pointer;
+  color: var(--accent-strong);
+  font-weight: 700;
+}
+
+.advanced-block[open] summary {
+  margin-bottom: 8px;
+}
