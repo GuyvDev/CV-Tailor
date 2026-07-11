@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hmac
 import json
 import os
 import re
 import shutil
+from datetime import UTC, datetime, timedelta
 
 import httpx
 from openai import OpenAI
@@ -30,6 +32,8 @@ from app.models import (
     GenerateRequest,
     GenerateResponse,
     JobMetadata,
+    OutputCleanupRequest,
+    OutputCleanupResponse,
     PersonalizationOptions,
     ProfileBundle,
     ProfileSummary,
@@ -60,7 +64,29 @@ def _stateless_only() -> bool:
     return os.getenv("STATELESS_ONLY", "false").strip().lower() in {"1", "true", "yes", "on"}
 
 
-STATELESS_ALLOWED_PREFIXES = ("/api/stateless", "/api/health", "/docs", "/redoc", "/openapi.json")
+def _docs_enabled() -> bool:
+    return settings.enable_docs
+
+
+def _public_files_enabled() -> bool:
+    return settings.public_files_enabled
+
+
+AUTH_EXEMPT_PREFIXES = ("/api/health",)
+
+
+def _stateless_allowed_prefixes() -> tuple[str, ...]:
+    prefixes = ["/api/stateless", "/api/health"]
+    if _docs_enabled():
+        prefixes.extend(["/docs", "/redoc", "/openapi.json"])
+    return tuple(prefixes)
+
+
+def _public_allowed_prefixes() -> tuple[str, ...]:
+    prefixes = ["/api/health"]
+    if _docs_enabled():
+        prefixes.extend(["/docs", "/redoc", "/openapi.json"])
+    return tuple(prefixes)
 
 
 PROFILE_FILES = {
@@ -619,24 +645,48 @@ class JobControl:
 
 job_controls: dict[str, JobControl] = {}
 
-app = FastAPI(title="cv-docker-api", version="0.1.0")
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+app = FastAPI(
+    title="cv-docker-api",
+    version="0.1.0",
+    docs_url="/docs" if _docs_enabled() else None,
+    redoc_url="/redoc" if _docs_enabled() else None,
+    openapi_url="/openapi.json" if _docs_enabled() else None,
 )
+if settings.allowed_origins:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=list(settings.allowed_origins),
+        allow_credentials=False,
+        allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
+        allow_headers=["Content-Type", "Authorization"],
+    )
+
+
+def _authorized(request: Request) -> bool:
+    token = settings.api_auth_token or ""
+    if not token:
+        return False
+    supplied = request.headers.get("authorization", "")
+    if supplied.lower().startswith("bearer "):
+        supplied = supplied[7:].strip()
+    else:
+        supplied = request.headers.get("x-api-token", "").strip()
+    return bool(supplied) and hmac.compare_digest(supplied, token)
 
 
 @app.middleware("http")
-async def stateless_only_guard(request: Request, call_next):
-    if _stateless_only() and request.url.path.startswith("/api/") and not request.url.path.startswith(STATELESS_ALLOWED_PREFIXES):
+async def production_guard(request: Request, call_next):
+    path = request.url.path
+    if _stateless_only() and path.startswith("/api/") and not path.startswith(_stateless_allowed_prefixes()):
         return JSONResponse({"detail": "This deployment is running in stateless-only mode."}, status_code=404)
+    protected_path = path.startswith("/api/") or path.startswith("/files/")
+    exempt_path = path.startswith(AUTH_EXEMPT_PREFIXES)
+    if not _stateless_only() and settings.require_api_auth and protected_path and not exempt_path and not _authorized(request):
+        return JSONResponse({"detail": "Authentication required."}, status_code=status.HTTP_401_UNAUTHORIZED)
     return await call_next(request)
 
 
-if not _stateless_only():
+if not _stateless_only() and _public_files_enabled():
     app.mount("/files", StaticFiles(directory=settings.output_dir), name="files")
 
 
@@ -921,6 +971,80 @@ def _load_stored_draft(job_id: str) -> ResumeDraft:
     if not draft_path.exists():
         raise FileNotFoundError(f"Draft for job '{job_id}' not found")
     return ResumeDraft.model_validate_json(draft_path.read_text(encoding="utf-8"))
+
+
+def _dir_size(path: Path) -> int:
+    if not path.exists():
+        return 0
+    return sum(item.stat().st_size for item in path.rglob("*") if item.is_file())
+
+
+def _load_job_metadata() -> list[JobMetadata]:
+    jobs: list[JobMetadata] = []
+    if not settings.output_dir.exists():
+        return jobs
+    for job_dir in settings.output_dir.iterdir():
+        meta_path = job_dir / "metadata.json"
+        if not meta_path.exists():
+            continue
+        try:
+            jobs.append(JobMetadata.model_validate_json(meta_path.read_text(encoding="utf-8")))
+        except Exception:
+            continue
+    return jobs
+
+
+def _cleanup_summary(deleted_job_ids: list[str] | None = None, bytes_before: int | None = None) -> OutputCleanupResponse:
+    jobs = _load_job_metadata()
+    total_jobs = len(jobs)
+    terminal_jobs = sum(1 for job in jobs if job.status in TERMINAL_STATUSES)
+    active_jobs = total_jobs - terminal_jobs
+    bytes_after = _dir_size(settings.output_dir)
+    deleted = deleted_job_ids or []
+    return OutputCleanupResponse(
+        output_dir=str(settings.output_dir),
+        total_jobs=total_jobs,
+        terminal_jobs=terminal_jobs,
+        active_jobs=active_jobs,
+        deleted_jobs=len(deleted),
+        deleted_job_ids=deleted,
+        retained_jobs=total_jobs,
+        bytes_before=bytes_after if bytes_before is None else bytes_before,
+        bytes_after=bytes_after,
+    )
+
+
+@app.get("/api/outputs/summary", response_model=OutputCleanupResponse)
+async def output_summary() -> OutputCleanupResponse:
+    return _cleanup_summary()
+
+
+@app.post("/api/outputs/cleanup", response_model=OutputCleanupResponse)
+async def cleanup_outputs(payload: OutputCleanupRequest) -> OutputCleanupResponse:
+    bytes_before = _dir_size(settings.output_dir)
+    cutoff = datetime.now(UTC) - timedelta(days=payload.older_than_days)
+    deleted: list[str] = []
+    for metadata in _load_job_metadata():
+        if metadata.status not in TERMINAL_STATUSES:
+            continue
+        if metadata.status == "failed" and not payload.include_failed:
+            continue
+        if metadata.status == "stopped" and not payload.include_stopped:
+            continue
+        if not payload.delete_all_terminal and metadata.created_at > cutoff:
+            continue
+        control = job_controls.get(metadata.job_id)
+        if control is not None and control.task is not None and not control.task.done():
+            continue
+        try:
+            job_store.delete(metadata.job_id)
+            job_controls.pop(metadata.job_id, None)
+            deleted.append(metadata.job_id)
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise HTTPException(status_code=500, detail=f"Failed to delete job '{metadata.job_id}'") from exc
+    return _cleanup_summary(deleted, bytes_before)
 
 
 @app.get("/api/jobs")

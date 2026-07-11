@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  audit-and-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Publish audit
+        run: ./scripts/publish_audit.sh
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install API dependencies
+        run: pip install -r api/requirements.txt -r compiler/requirements.txt -r telegram-bot/requirements.txt
+
+      - name: Python syntax check
+        run: python -m py_compile api/app/*.py api/app/services/*.py compiler/app/*.py telegram-bot/app/*.py
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Build frontend
+        working-directory: frontend
+        run: npm ci && npm run build
+
+      - name: Validate regular Docker Compose
+        run: docker compose -f docker-compose.yml config
+
+      - name: Validate stateless Docker Compose
+        run: docker compose -f docker-compose.stateless.yml config

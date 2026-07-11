@@ -191,6 +191,26 @@ class StatelessGenerateResponse(BaseModel):
     model_name: str
 
 
+
+
+class OutputCleanupRequest(BaseModel):
+    older_than_days: int = Field(default=30, ge=0, le=3650)
+    include_failed: bool = True
+    include_stopped: bool = True
+    delete_all_terminal: bool = False
+
+
+class OutputCleanupResponse(BaseModel):
+    output_dir: str
+    total_jobs: int
+    terminal_jobs: int
+    active_jobs: int
+    deleted_jobs: int = 0
+    deleted_job_ids: list[str] = Field(default_factory=list)
+    retained_jobs: int
+    bytes_before: int
+    bytes_after: int
+
 class RuntimeConfigResponse(BaseModel):
     llm_provider: str
     model_name: str

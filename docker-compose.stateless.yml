@@ -18,6 +18,10 @@ services:
       context: ./api
     environment:
       STATELESS_ONLY: "true"
+      APP_ENV: ${APP_ENV:-production}
+      API_ENABLE_DOCS: ${API_ENABLE_DOCS:-false}
+      API_PUBLIC_FILES_ENABLED: ${API_PUBLIC_FILES_ENABLED:-false}
+      API_ALLOWED_ORIGINS: ${API_ALLOWED_ORIGINS:-}
       STATELESS_LLM_PROVIDER: ${STATELESS_LLM_PROVIDER:-gemini}
       STATELESS_MODEL_NAME: ${STATELESS_MODEL_NAME:-gemini-2.5-flash}
       STATELESS_BASE_URL: ${STATELESS_BASE_URL:-https://generativelanguage.googleapis.com/v1beta/openai}

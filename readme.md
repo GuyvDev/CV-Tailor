@@ -49,6 +49,33 @@ docker compose up --build
 
 The API is available at `http://localhost:8000`.
 
+## Deployment Modes
+
+Use the two Compose files for different jobs:
+
+| Mode | File | Best for | Stores profile/jobs/files | Telegram | Public internet |
+| --- | --- | --- | --- | --- | --- |
+| Private stateful | `docker-compose.yml` | Local use, private VPS, Telegram workflow | Yes | Yes | Only behind VPN/reverse-proxy auth |
+| Public stateless | `docker-compose.stateless.yml` or Vercel | Simple public/demo CV generation | No | No | Yes, with HTTPS and rate limits |
+
+The regular Docker stack is intentionally stateful. It mounts `./data` and `./outputs`, keeps job history, and runs the optional Telegram bot. The stateless stack is separate and does not mount private profile/output directories into the API container.
+
+## Production Safety
+
+Public/stateless deployments should use HTTPS, request-size limits, rate limiting, and access logs without request bodies. Private/stateful deployments should stay on localhost, a VPN, or behind your own authentication layer because the API can read and write private profile data, saved provider settings, and generated resume files.
+
+Before exposing the stateful API outside your machine, set:
+
+```env
+APP_ENV=production
+REQUIRE_API_AUTH=true
+API_AUTH_TOKEN=generate-a-long-random-token
+API_ALLOWED_ORIGINS=https://your-frontend.example
+ENABLE_DEMO_MODE=false
+```
+
+When `APP_ENV=production` or `REQUIRE_API_AUTH=true`, private stateful endpoints fail closed unless `API_AUTH_TOKEN` is configured. Requests to those endpoints must send `Authorization: Bearer <API_AUTH_TOKEN>` or `X-API-Token: <API_AUTH_TOKEN>`. For browser-facing production use, prefer putting the API behind a reverse proxy that injects the token or performs its own auth; do not publish a long-lived admin token in frontend JavaScript. Production mode also disables `/docs`, `/redoc`, `/openapi.json`, and public `/files` serving by default unless you explicitly enable them.
+
 ## Profile Files
 
 The default private profile lives under `PROFILE_DIR`, which defaults to `/app/data/profile` inside Docker and `./data/profile` on your machine. Additional users/profiles are stored under `data/profiles/<profile-id>/` and selected from the Personalize tab.
@@ -137,6 +164,8 @@ Recommended architecture:
 - Run `frontend`, `api`, and `typst-compiler` with `docker-compose.stateless.yml`.
 - Put the VPS behind HTTPS with Caddy, Nginx, Cloudflare Tunnel, or another reverse proxy.
 - Set `STATELESS_ONLY=true` so profile/job persistence endpoints return 404.
+- Set `APP_ENV=production`, `API_ENABLE_DOCS=false`, and `API_PUBLIC_FILES_ENABLED=false`.
+- Set `API_ALLOWED_ORIGINS` to the exact HTTPS frontend origin if the browser calls the API cross-origin; leave it empty for same-origin reverse-proxy deployments.
 - Keep `FLASH_API_KEY` only in `.env` on the VPS.
 - Add reverse-proxy request size limits, rate limits, and access logs without request bodies.
 
@@ -149,6 +178,10 @@ STATELESS_LLM_PROVIDER=gemini
 STATELESS_MODEL_NAME=gemini-2.5-flash
 STATELESS_BASE_URL=https://generativelanguage.googleapis.com/v1beta/openai
 STATELESS_ENABLE_DEMO_MODE=false
+APP_ENV=production
+API_ENABLE_DOCS=false
+API_PUBLIC_FILES_ENABLED=false
+API_ALLOWED_ORIGINS=
 FRONTEND_PORT=3000
 API_PORT=8000
 ```
@@ -161,7 +194,16 @@ docker compose -f docker-compose.stateless.yml up --build -d
 
 The stateless compose file does not mount `data/` or `outputs/` into the API container. The API container is read-only and uses `tmpfs` for `/tmp`; the compiler also uses `tmpfs`. Generated PDFs are returned to the browser instead of written to `outputs/`.
 
-For production, prefer exposing only the frontend through HTTPS and keeping the API reachable only from the reverse proxy or private network. Even stateless CV generation still handles private text in memory, so do not log request bodies.
+For production, prefer exposing only the frontend through HTTPS and keeping the API reachable only from the reverse proxy or private network. Even stateless CV generation still handles private text in memory, so do not log request bodies. Do not deploy the stateful `docker-compose.yml` stack publicly unless you add authentication and intentionally enable file serving.
+
+## Output Retention
+
+The Personalize tab includes an Output Retention panel for the stateful app. It shows the output directory, stored job count, active jobs, and archive size. You can delete terminal jobs older than a chosen number of days or delete all terminal job archives. Running/queued jobs are retained.
+
+The same behavior is available through:
+
+- `GET /api/outputs/summary`
+- `POST /api/outputs/cleanup` with `older_than_days`, `include_failed`, `include_stopped`, and `delete_all_terminal`
 
 ## Telegram Bot Setup
 
@@ -175,6 +217,8 @@ The Telegram bot is optional. It talks to the API service inside Docker and uses
 TELEGRAM_BOT_TOKEN=123456:your-token
 TELEGRAM_ALLOWED_USER_IDS=123456789
 API_URL=http://api:8000
+# Only needed if REQUIRE_API_AUTH=true or APP_ENV=production for the stateful API.
+API_AUTH_TOKEN=the-same-token-used-by-api
 ```
 
 4. Start the stack with the bot:
@@ -191,6 +235,7 @@ Operational notes:
 - Keep `TELEGRAM_ALLOWED_USER_IDS` set; otherwise anyone who gets the bot token may use your generator.
 - Rotate the bot token in BotFather if it is ever committed, shared, or exposed.
 - Restart `telegram-bot` after changing Telegram env values: `docker compose restart telegram-bot`.
+- The normal `docker-compose.yml` stack is stateful and keeps the Telegram workflow; `docker-compose.stateless.yml` is a separate public/demo deployment path.
 - The bot uses the active profile selected in the web UI. Switch profiles in the Personalize tab before sending Telegram jobs.
 
 AI helper prompt for Telegram setup:
@@ -210,9 +255,9 @@ python3 scripts/e2e_full_smoke.py
 
 The test creates a temporary profile under `data/profiles/`, switches to it, changes app settings, uses AI Setup Draft, saves generated profile files, creates a tailored CV, renders the PDF to `temp/e2e/*.png`, checks the image is nonblank, and restores the previously active profile.
 
-## Publish Checklist
+## CI and Publish Checklist
 
-Before the first GitHub commit:
+GitHub Actions runs the publish audit, Python syntax checks, frontend build, and Docker Compose config validation for both deployment modes. Before the first GitHub commit or production deploy, run the local audit too:
 
 ```bash
 ./scripts/publish_audit.sh
@@ -233,6 +278,7 @@ If a secret or personal file is ever committed, remove it from history before pu
 ## Current Boundaries
 
 - File-backed job metadata, not a production database.
-- No authentication; run locally or add auth before deploying publicly.
+- Stateful mode has a simple bearer-token gate for private endpoints; use a reverse proxy, VPN, or full identity-aware auth for multi-user production.
+- Production mode disables docs and public `/files` serving by default when `APP_ENV=production` or `PRODUCTION=true`.
 - The profile editor is local-first and writes to `PROFILE_DIR`.
 - Demo mode is for smoke testing, not final resume quality.

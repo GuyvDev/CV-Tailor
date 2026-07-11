@@ -34,6 +34,14 @@ ALLOWED_USER_IDS: set[int] = set(
     if x.strip()
 )
 API_URL = os.environ.get("API_URL", "http://api:8000")
+API_AUTH_TOKEN = os.environ.get("API_AUTH_TOKEN", "").strip()
+
+
+def api_headers() -> dict[str, str]:
+    if not API_AUTH_TOKEN:
+        return {}
+    return {"Authorization": f"Bearer {API_AUTH_TOKEN}"}
+
 
 SCRAPE_HEADERS = {
     "User-Agent": (
@@ -474,7 +482,7 @@ async def submit_job(
     if approved_draft is not None:
         payload["approved_draft"] = approved_draft
     try:
-        async with httpx.AsyncClient(timeout=30) as client:
+        async with httpx.AsyncClient(timeout=30, headers=api_headers()) as client:
             resp = await client.post(f"{API_URL}/api/generate", json=payload)
             resp.raise_for_status()
             job_id = resp.json()["job_id"]
@@ -486,7 +494,7 @@ async def submit_job(
 
 async def submit_edit_preview(source_job_id: str, edit_instructions: str) -> dict:
     try:
-        async with httpx.AsyncClient(timeout=120) as client:
+        async with httpx.AsyncClient(timeout=120, headers=api_headers()) as client:
             resp = await client.post(
                 f"{API_URL}/api/edit-preview",
                 json={
@@ -505,7 +513,7 @@ async def request_score_resume(source_job_id: str, job_description: str | None =
     if job_description is not None:
         payload["job_description"] = job_description
     try:
-        async with httpx.AsyncClient(timeout=120) as client:
+        async with httpx.AsyncClient(timeout=120, headers=api_headers()) as client:
             resp = await client.post(f"{API_URL}/api/score-existing", json=payload)
             resp.raise_for_status()
             return resp.json()
@@ -525,7 +533,7 @@ async def poll_job(job_id: str, status_msg: Message | None, domain: str, max_sec
     logger.info(f"Polling job {job_id}...")
     last_stage = None
     try:
-        async with httpx.AsyncClient(timeout=15) as client:
+        async with httpx.AsyncClient(timeout=15, headers=api_headers()) as client:
             for _ in range(max_seconds // 5):
                 await asyncio.sleep(5)
                 resp = await client.get(f"{API_URL}/api/jobs/{job_id}")
@@ -561,7 +569,7 @@ async def poll_job(job_id: str, status_msg: Message | None, domain: str, max_sec
 
 async def download_artifact(url: str) -> bytes:
     try:
-        async with httpx.AsyncClient(timeout=60) as client:
+        async with httpx.AsyncClient(timeout=60, headers=api_headers()) as client:
             resp = await client.get(f"{API_URL}{url}")
             resp.raise_for_status()
             return resp.content
@@ -580,7 +588,7 @@ async def download_typst(typst_url: str) -> bytes:
 async def fetch_cv_list() -> list[dict]:
     """Return all jobs from the API sorted newest first."""
     try:
-        async with httpx.AsyncClient(timeout=15) as client:
+        async with httpx.AsyncClient(timeout=15, headers=api_headers()) as client:
             resp = await client.get(f"{API_URL}/api/jobs")
             resp.raise_for_status()
             return resp.json()
@@ -760,7 +768,7 @@ def build_confirm_keyboard(session_id: str, mode: str) -> InlineKeyboardMarkup:
 
 async def fetch_job(job_id: str) -> dict | None:
     try:
-        async with httpx.AsyncClient(timeout=15) as client:
+        async with httpx.AsyncClient(timeout=15, headers=api_headers()) as client:
             resp = await client.get(f"{API_URL}/api/jobs/{job_id}")
             if resp.status_code == 200:
                 return resp.json()
@@ -771,7 +779,7 @@ async def fetch_job(job_id: str) -> dict | None:
 
 async def request_stop_job(job_id: str) -> tuple[dict | None, str | None]:
     try:
-        async with httpx.AsyncClient(timeout=15) as client:
+        async with httpx.AsyncClient(timeout=15, headers=api_headers()) as client:
             resp = await client.post(f"{API_URL}/api/jobs/{job_id}/stop")
             if resp.status_code == 200:
                 return resp.json(), None
@@ -784,7 +792,7 @@ async def request_stop_job(job_id: str) -> tuple[dict | None, str | None]:
 
 async def request_delete_job(job_id: str) -> tuple[bool, str | None]:
     try:
-        async with httpx.AsyncClient(timeout=15) as client:
+        async with httpx.AsyncClient(timeout=15, headers=api_headers()) as client:
             resp = await client.delete(f"{API_URL}/api/jobs/{job_id}")
             if resp.status_code == 204:
                 return True, None

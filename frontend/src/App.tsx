@@ -110,6 +110,26 @@ type StatelessGenerateResponse = {
   model_name: string;
 };
 
+type OutputSummary = {
+  output_dir: string;
+  total_jobs: number;
+  terminal_jobs: number;
+  active_jobs: number;
+  deleted_jobs: number;
+  deleted_job_ids: string[];
+  retained_jobs: number;
+  bytes_before: number;
+  bytes_after: number;
+};
+
+type JobListItem = {
+  job_id: string;
+  status: string;
+  label: string;
+  job_title: string;
+  created_at: string;
+};
+
 const telegramSetupPrompt = `I am configuring a local Docker CV tailoring app with an optional Telegram bot. Guide me step by step. Ask me for my BotFather token, my numeric Telegram user id, and whether I run Docker Compose locally or on a server. Then help me set TELEGRAM_BOT_TOKEN, TELEGRAM_ALLOWED_USER_IDS, and API_URL=http://api:8000 in .env, restart docker compose, verify the bot responds, and explain how to rotate the token if I accidentally expose it. Do not ask me to paste secrets into a public chat.`;
 
 const cvDataPreparationPrompt = `You are helping me prepare structured private CV data for a stateless CV tailoring tool. I will paste my resume, LinkedIn text, project notes, portfolio notes, education, skills, and preferences.
@@ -250,6 +270,12 @@ export function App() {
   const [statelessResult, setStatelessResult] = useState<StatelessGenerateResponse | null>(null);
   const [statelessError, setStatelessError] = useState<string | null>(null);
   const [isGeneratingStateless, setIsGeneratingStateless] = useState(false);
+  const [outputSummary, setOutputSummary] = useState<OutputSummary | null>(null);
+  const [cleanupDays, setCleanupDays] = useState(30);
+  const [cleanupStatus, setCleanupStatus] = useState<string | null>(null);
+  const [isCleaningOutputs, setIsCleaningOutputs] = useState(false);
+  const [jobList, setJobList] = useState<JobListItem[]>([]);
+  const [jobSearch, setJobSearch] = useState("");
 
   function resetJob() {
     setJob(null);
@@ -257,11 +283,13 @@ export function App() {
   }
 
   async function refreshSetup() {
-    const [configResponse, profileResponse, appSettingsResponse, profilesResponse] = await Promise.all([
+    const [configResponse, profileResponse, appSettingsResponse, profilesResponse, outputResponse, jobsResponse] = await Promise.all([
       fetch(`${apiBaseUrl}/api/config`),
       fetch(`${apiBaseUrl}/api/profile`),
       fetch(`${apiBaseUrl}/api/app-settings`),
       fetch(`${apiBaseUrl}/api/profiles`),
+      fetch(`${apiBaseUrl}/api/outputs/summary`),
+      fetch(`${apiBaseUrl}/api/jobs`),
     ]);
     if (configResponse.ok) {
       setConfig(await configResponse.json());
@@ -274,6 +302,12 @@ export function App() {
     }
     if (profilesResponse.ok) {
       setProfiles(await profilesResponse.json());
+    }
+    if (outputResponse.ok) {
+      setOutputSummary(await outputResponse.json());
+    }
+    if (jobsResponse.ok) {
+      setJobList(await jobsResponse.json());
     }
   }
 
@@ -579,25 +613,97 @@ export function App() {
     }
   }
 
+
+  function formatBytes(value: number): string {
+    if (value < 1024) return `${value} B`;
+    if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`;
+    if (value < 1024 * 1024 * 1024) return `${(value / 1024 / 1024).toFixed(1)} MB`;
+    return `${(value / 1024 / 1024 / 1024).toFixed(1)} GB`;
+  }
+
+  function jsonStatus(value: string, expected: "array" | "object"): string {
+    try {
+      const parsed = JSON.parse(value || (expected === "array" ? "[]" : "{}"));
+      if (expected === "array" && !Array.isArray(parsed)) return "Must be a JSON array.";
+      if (expected === "object" && (Array.isArray(parsed) || parsed === null || typeof parsed !== "object")) return "Must be a JSON object.";
+      return "Valid JSON.";
+    } catch (jsonError) {
+      return jsonError instanceof Error ? jsonError.message : "Invalid JSON.";
+    }
+  }
+
+  async function cleanupOutputs(deleteAllTerminal = false) {
+    setIsCleaningOutputs(true);
+    setCleanupStatus(null);
+    setProfileError(null);
+    try {
+      const response = await fetch(`${apiBaseUrl}/api/outputs/cleanup`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          older_than_days: cleanupDays,
+          include_failed: true,
+          include_stopped: true,
+          delete_all_terminal: deleteAllTerminal,
+        }),
+      });
+      if (!response.ok) {
+        const payload = await response.json().catch(() => null);
+        throw new Error(payload?.detail || "Output cleanup failed.");
+      }
+      const summary: OutputSummary = await response.json();
+      setOutputSummary(summary);
+      setCleanupStatus(`Deleted ${summary.deleted_jobs} job archive${summary.deleted_jobs === 1 ? "" : "s"}.`);
+      await refreshSetup();
+    } catch (cleanupError) {
+      setProfileError(cleanupError instanceof Error ? cleanupError.message : "Unknown cleanup error.");
+    } finally {
+      setIsCleaningOutputs(false);
+    }
+  }
+
   const progress = generationProgress(job);
   const currentProfile = profiles.find((item) => item.profile_id === profile.profile_id);
+  const filteredJobs = jobList.filter((item) => {
+    const haystack = `${item.job_id} ${item.status} ${item.label} ${item.job_title}`.toLowerCase();
+    return haystack.includes(jobSearch.trim().toLowerCase());
+  });
+  const setupItems = statelessOnly
+    ? [
+        { label: "Model key", done: Boolean(import.meta.env.VITE_STATELESS_ONLY) },
+        { label: "Candidate data", done: statelessCandidate.trim().length >= 20 },
+        { label: "Job text", done: statelessJob.trim().length >= 20 },
+      ]
+    : [
+        { label: "Profile", done: profile.exists },
+        { label: "Model", done: Boolean(config?.live_model_available || config?.demo_mode_enabled) },
+        { label: "Template", done: profile.template_exists },
+        { label: "Outputs", done: Boolean(outputSummary) },
+      ];
 
   return (
     <main className="shell">
       <section className="hero">
-        <p className="eyebrow">CV Docker</p>
-        <h1>Tailor your resume to a job description and export it as a one-page PDF.</h1>
-        <p className="lede">
-          The agent reads your local profile files, selects the strongest evidence,
-          scores the draft, revises it once when needed, and returns the final PDF plus Typst source.
-        </p>
+        <div className="hero-topline">
+          <p className="eyebrow">CV Tailor</p>
+          <span className={statelessOnly ? "mode-badge stateless" : "mode-badge stateful"}>{statelessOnly ? "Stateless public" : "Private stateful"}</span>
+        </div>
+        <h1>Build a focused one-page CV.</h1>
+        <p className="lede">Paste your facts, add a job description, and export a polished PDF with editable Typst source.</p>
+        <div className="setup-rail" aria-label="Setup status">
+          {setupItems.map((item) => (
+            <span className={item.done ? "setup-chip done" : "setup-chip"} key={item.label}>{item.done ? "Ready" : "Check"} · {item.label}</span>
+          ))}
+        </div>
       </section>
 
-      <nav className="tabs" aria-label="Workspace views">
-        {!statelessOnly ? <button className={activeView === "generate" ? "tab active" : "tab"} type="button" onClick={() => setActiveView("generate")}>Generate</button> : null}
-        <button className={activeView === "stateless" ? "tab active" : "tab"} type="button" onClick={() => setActiveView("stateless")}>Stateless</button>
-        {!statelessOnly ? <button className={activeView === "personalize" ? "tab active" : "tab"} type="button" onClick={() => setActiveView("personalize")}>Personalize</button> : null}
-      </nav>
+      {!statelessOnly ? (
+        <nav className="tabs" aria-label="Workspace views">
+          <button className={activeView === "generate" ? "tab active" : "tab"} type="button" onClick={() => setActiveView("generate")}>Generate</button>
+          <button className={activeView === "stateless" ? "tab active" : "tab"} type="button" onClick={() => setActiveView("stateless")}>Stateless</button>
+          <button className={activeView === "personalize" ? "tab active" : "tab"} type="button" onClick={() => setActiveView("personalize")}>Personalize</button>
+        </nav>
+      ) : null}
 
       {activeView === "generate" ? (
         <>
@@ -691,6 +797,12 @@ export function App() {
                   {job.typst_url ? <a href="https://typst.app/play/" rel="noreferrer" target="_blank">Open Typst playground</a> : null}
                 </div>
 
+                {job.pdf_url ? (
+                  <div className="pdf-preview">
+                    <iframe title="Generated CV preview" src={`${apiBaseUrl}${job.pdf_url}`} />
+                  </div>
+                ) : null}
+
                 {job.compile_logs.length > 0 ? (
                   <div className="logs">
                     <h3>Compile log</h3>
@@ -703,25 +815,42 @@ export function App() {
         </>
       ) : activeView === "stateless" ? (
         <>
+          <section className="workflow-strip" aria-label="Stateless CV workflow">
+            <div>
+              <span>1</span>
+              <strong>Prepare facts</strong>
+              <p>Use the prompt with your preferred AI.</p>
+            </div>
+            <div>
+              <span>2</span>
+              <strong>Review data</strong>
+              <p>Paste the JSON and keep only true details.</p>
+            </div>
+            <div>
+              <span>3</span>
+              <strong>Generate CV</strong>
+              <p>Add the role and download the result.</p>
+            </div>
+          </section>
           <section className="panel">
             <div className="form">
               <div className="notice privacy-note">
-                <strong>Privacy shape:</strong> this hosted stateless demo only uses the CV data you paste for this one generation. It does not create server-side profiles, job history, or output files. For stronger privacy, the GitHub project can run locally with your profile stored on your own machine, and it includes Telegram bot integration for a private local-bot workflow without publishing a web UI to the internet.
+                <strong>Stateless demo:</strong> pasted CV data is used for this generation only. No server profile, job history, or output archive is created. For maximum privacy, run the GitHub project locally or use the included Telegram bot workflow on your own machine.
               </div>
 
               <div className="subsection prompt-helper">
                 <div className="result-header">
-                  <h3>1. Prepare Your CV Data With Your AI</h3>
+                  <h3>Prepare Your CV Data</h3>
                   <button className="small-button" type="button" onClick={() => navigator.clipboard.writeText(cvDataPreparationPrompt)}>Copy prompt</button>
                 </div>
                 <label className="field">
-                  <span>Prompt to paste into ChatGPT, Gemini, Claude, or another AI</span>
+                  <span>Prompt for ChatGPT, Gemini, Claude, or another AI</span>
                   <textarea className="mono" readOnly rows={12} value={cvDataPreparationPrompt} />
                 </label>
               </div>
 
               <div className="subsection">
-                <h3>2. Paste The AI Output</h3>
+                <h3>Paste Prepared Data</h3>
                 <label className="field">
                   <span>Prepared CV data JSON</span>
                   <textarea
@@ -741,7 +870,7 @@ export function App() {
           <section className="panel">
             <form className="form" onSubmit={generateStateless}>
               <div className="result-header">
-                <h2>3. Generate A Tailored CV</h2>
+                <h2>Generate Tailored CV</h2>
               </div>
               <div className="settings-grid">
                 <label className="field">
@@ -758,7 +887,7 @@ export function App() {
                 </label>
               </div>
               <label className="field">
-                <span>Candidate profile loaded from prepared JSON</span>
+                <span>Candidate profile</span>
                 <textarea value={statelessCandidate} onChange={(event) => setStatelessCandidate(event.target.value)} rows={9} required />
               </label>
               <details className="advanced-block">
@@ -766,10 +895,12 @@ export function App() {
                 <label className="field">
                   <span>Projects JSON</span>
                   <textarea className="mono" value={statelessProjects} onChange={(event) => setStatelessProjects(event.target.value)} rows={8} />
+                  <small className={jsonStatus(statelessProjects, "array") === "Valid JSON." ? "field-hint valid" : "field-hint invalid"}>{jsonStatus(statelessProjects, "array")}</small>
                 </label>
                 <label className="field">
                   <span>Skills JSON</span>
                   <textarea className="mono" value={statelessSkills} onChange={(event) => setStatelessSkills(event.target.value)} rows={6} />
+                  <small className={jsonStatus(statelessSkills, "object") === "Valid JSON." ? "field-hint valid" : "field-hint invalid"}>{jsonStatus(statelessSkills, "object")}</small>
                 </label>
                 <label className="field">
                   <span>Generation rules</span>
@@ -778,10 +909,10 @@ export function App() {
               </details>
               <label className="field">
                 <span>Job description</span>
-                <textarea value={statelessJob} onChange={(event) => setStatelessJob(event.target.value)} rows={10} required />
+                <textarea value={statelessJob} onChange={(event) => setStatelessJob(event.target.value)} rows={10} placeholder="Paste the role description here..." required />
               </label>
               <button disabled={isGeneratingStateless || statelessCandidate.trim().length < 20 || statelessJob.trim().length < 20} type="submit">
-                {isGeneratingStateless ? "Generating..." : "Generate stateless PDF"}
+                {isGeneratingStateless ? "Generating..." : "Generate PDF"}
               </button>
             </form>
           </section>
@@ -804,6 +935,9 @@ export function App() {
                   <button className="small-button" type="button" onClick={() => downloadBase64File(`${statelessResult.output_basename}.pdf`, statelessResult.pdf_base64, "application/pdf")}>Download PDF</button>
                   <button className="small-button" type="button" onClick={() => downloadTextFile(`${statelessResult.output_basename}.typ`, statelessResult.typst_source)}>Download Typst</button>
                   <a href="https://typst.app/play/" rel="noreferrer" target="_blank">Open Typst playground</a>
+                </div>
+                <div className="pdf-preview">
+                  <iframe title="Stateless CV preview" src={`data:application/pdf;base64,${statelessResult.pdf_base64}`} />
                 </div>
                 {statelessResult.compile_logs.length > 0 ? <pre className="inline-log">{statelessResult.compile_logs.join("\n")}</pre> : null}
               </div>
@@ -830,6 +964,46 @@ export function App() {
 
           <div className="notice">
             App settings are saved locally in your private profile folder. Stored API keys are never displayed after saving; enter a new key only when you want to replace one.
+          </div>
+
+          <div className="subsection storage-block">
+            <div className="result-header">
+              <h3>Output Retention</h3>
+              <button className="small-button" type="button" onClick={() => refreshSetup()}>Refresh storage</button>
+            </div>
+            <div className="status-grid compact">
+              <div><strong>Output directory</strong><span>{outputSummary?.output_dir || config?.output_dir || "not loaded"}</span></div>
+              <div><strong>Stored jobs</strong><span>{outputSummary ? `${outputSummary.total_jobs} total / ${outputSummary.active_jobs} active` : "not loaded"}</span></div>
+              <div><strong>Archive size</strong><span>{outputSummary ? formatBytes(outputSummary.bytes_after) : "not loaded"}</span></div>
+            </div>
+            <div className="settings-grid retention-controls">
+              <label className="field">
+                <span>Delete terminal jobs older than days</span>
+                <input min={0} max={3650} type="number" value={cleanupDays} onChange={(event) => setCleanupDays(Number(event.target.value || 0))} />
+              </label>
+              <div className="actions-row align-end">
+                <button className="small-button" disabled={isCleaningOutputs} type="button" onClick={() => cleanupOutputs(false)}>Clean old outputs</button>
+                <button className="small-button danger-button" disabled={isCleaningOutputs || !outputSummary?.terminal_jobs} type="button" onClick={() => cleanupOutputs(true)}>Delete terminal outputs</button>
+              </div>
+            </div>
+            {cleanupStatus ? <p className="success">{cleanupStatus}</p> : null}
+            <div className="job-history">
+              <label className="field">
+                <span>Job history search</span>
+                <input value={jobSearch} onChange={(event) => setJobSearch(event.target.value)} placeholder="Search id, status, label, or title" />
+              </label>
+              <div className="job-table" role="table" aria-label="Stored job history">
+                {filteredJobs.slice(0, 12).map((item) => (
+                  <div className="job-row" role="row" key={item.job_id}>
+                    <span>{item.job_id}</span>
+                    <span>{item.status}</span>
+                    <span>{item.job_title || item.label || "Untitled"}</span>
+                    <span>{new Date(item.created_at).toLocaleDateString()}</span>
+                  </div>
+                ))}
+                {filteredJobs.length === 0 ? <p className="muted">No stored jobs match that filter.</p> : null}
+              </div>
+            </div>
           </div>
 
           <div className="subsection">
@@ -964,10 +1138,12 @@ export function App() {
             <label className="field">
               <span>Projects JSON</span>
               <textarea className="mono" value={profile.projects_json} onChange={(event) => setProfile({ ...profile, projects_json: event.target.value })} rows={14} />
+              <small className={jsonStatus(profile.projects_json, "array") === "Valid JSON." ? "field-hint valid" : "field-hint invalid"}>{jsonStatus(profile.projects_json, "array")}</small>
             </label>
             <label className="field">
               <span>Skills JSON</span>
               <textarea className="mono" value={profile.skills_json} onChange={(event) => setProfile({ ...profile, skills_json: event.target.value })} rows={10} />
+              <small className={jsonStatus(profile.skills_json, "object") === "Valid JSON." ? "field-hint valid" : "field-hint invalid"}>{jsonStatus(profile.skills_json, "object")}</small>
             </label>
             <label className="field">
               <span>Rules</span>

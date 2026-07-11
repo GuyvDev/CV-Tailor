@@ -322,7 +322,7 @@ export default async function handler(req: any, res: any) {
       output_basename: safePart(body.output_basename || "tailored-resume"),
       model_name: process.env.STATELESS_MODEL_NAME || "gemini-2.5-flash",
     });
-  } catch (error) {
-    return jsonResponse(res, 500, { detail: error instanceof Error ? error.message : "Unknown generation error." });
+  } catch {
+    return jsonResponse(res, 500, { detail: "Generation failed." });
   }
 }
