@@ -670,42 +670,52 @@ export function App() {
     const haystack = `${item.job_id} ${item.status} ${item.label} ${item.job_title}`.toLowerCase();
     return haystack.includes(jobSearch.trim().toLowerCase());
   });
-  const setupItems = statelessOnly
-    ? [
-        { label: "Model key", done: Boolean(import.meta.env.VITE_STATELESS_ONLY) },
-        { label: "Candidate data", done: statelessCandidate.trim().length >= 20 },
-        { label: "Job text", done: statelessJob.trim().length >= 20 },
-      ]
-    : [
-        { label: "Profile", done: profile.exists },
-        { label: "Model", done: Boolean(config?.live_model_available || config?.demo_mode_enabled) },
-        { label: "Template", done: profile.template_exists },
-        { label: "Outputs", done: Boolean(outputSummary) },
-      ];
+  const setupItems = [
+    { label: "Profile", done: profile.exists },
+    { label: "Model", done: Boolean(config?.live_model_available || config?.demo_mode_enabled) },
+    { label: "Template", done: profile.template_exists },
+    { label: "Outputs", done: Boolean(outputSummary) },
+  ];
+  const heroMetrics = [
+    { value: profile.exists ? "Ready" : "New", label: "Profile" },
+    { value: String(job?.quality_score ?? "AI"), label: "Quality" },
+    { value: String(job?.page_count ?? 1), label: "Page goal" },
+  ];
 
   return (
-    <main className="shell">
+    <main className={statelessOnly ? "shell stateless-shell" : "shell"}>
       <section className="hero">
-        <div className="hero-topline">
-          <p className="eyebrow">CV Tailor</p>
-          <span className={statelessOnly ? "mode-badge stateless" : "mode-badge stateful"}>{statelessOnly ? "Stateless public" : "Private stateful"}</span>
-        </div>
-        <h1>Build a focused one-page CV.</h1>
-        <p className="lede">Paste your facts, add a job description, and export a polished PDF with editable Typst source.</p>
-        <div className="setup-rail" aria-label="Setup status">
-          {setupItems.map((item) => (
-            <span className={item.done ? "setup-chip done" : "setup-chip"} key={item.label}>{item.done ? "Ready" : "Check"} · {item.label}</span>
-          ))}
+        <div className="hero-layout">
+          <div className="hero-copy">
+            {!statelessOnly ? (
+              <div className="hero-topline">
+                <p className="eyebrow">CV Tailor</p>
+                <span className="mode-badge stateful">Private stateful</span>
+              </div>
+            ) : null}
+            <h1>{statelessOnly ? "Build a CV that gets you noticed." : "Build a CV that helps you land your next job."}</h1>
+            <p className="lede">Paste your information, add a job description, and export a polished PDF with editable Typst source.</p>
+            {!statelessOnly ? (
+              <div className="setup-rail" aria-label="Setup status">
+                {setupItems.map((item) => (
+                  <span className={item.done ? "setup-chip done" : "setup-chip"} key={item.label}>{item.done ? "Ready" : "Check"} · {item.label}</span>
+                ))}
+              </div>
+            ) : null}
+          </div>
+          {!statelessOnly ? (
+            <div className={`hero-metrics metric-count-${heroMetrics.length}`} aria-label="CV readiness summary">
+              {heroMetrics.map((metric) => <div key={metric.label}><strong>{metric.value}</strong><span>{metric.label}</span></div>)}
+            </div>
+          ) : null}
         </div>
       </section>
 
       <section className="product-proof" aria-label="Stateful Docker and Telegram edition">
         <div className="product-proof-copy">
-          <p className="eyebrow">Also available: Stateful Docker edition</p>
-          <span className="stateful-only-label">Not part of this Stateless web app</span>
-          <h2>Send a job to Telegram. Get a tailored CV back.</h2>
-          <p>This video shows the self-hosted Stateful edition: Docker, your saved private profile, job history, and an approved Telegram bot. Build it from GitHub when you want that private workflow.</p>
-          <a className="github-link" href={githubProjectUrl} rel="noreferrer" target="_blank">Build the Stateful edition from GitHub</a>
+          <h2>Send a job posting through Telegram and receive a tailored CV.</h2>
+          <p>The self-hosted edition lets you securely save your profile and job history and use an approved Telegram bot. Deploy it from GitHub.</p>
+          <a className="github-link" href={githubProjectUrl} rel="noreferrer" target="_blank">{statelessOnly ? "Build your Telegram CV bot" : "Build the Stateful edition from GitHub"}</a>
         </div>
         <div className="demo-video" aria-label="Stateful Telegram workflow demo">
           <video controls playsInline preload="metadata" src={demoVideoUrl}>
@@ -723,8 +733,8 @@ export function App() {
       ) : null}
 
       {activeView === "generate" ? (
-        <>
-          <section className="panel">
+        <div className="generation-workspace">
+          <section className="panel generation-form-panel">
             <form className="form" onSubmit={onSubmit}>
               <label className="field">
                 <span>Role focus</span>
@@ -829,13 +839,13 @@ export function App() {
               </div>
             ) : null}
           </section>
-        </>
+        </div>
       ) : activeView === "stateless" ? (
         <>
           <section className="workflow-strip" aria-label="Stateless CV workflow">
             <div>
               <span>1</span>
-              <strong>Prepare facts</strong>
+              <strong>Prepare information</strong>
               <p>Use the prompt with your preferred AI.</p>
             </div>
             <div>
