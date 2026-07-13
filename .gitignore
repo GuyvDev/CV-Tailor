@@ -1,6 +1,7 @@
 .env
 .env.*
 !.env.example
+!.env.stateful.production.example
 .venv/
 .venv-extract/
 __pycache__/
@@ -17,3 +18,5 @@ temp/
 outputs/*
 !outputs/.gitkeep
 frontend-ui*.png
+data.prod/
+outputs.prod/

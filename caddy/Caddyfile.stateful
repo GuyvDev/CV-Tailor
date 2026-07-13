@@ -1,0 +1,15 @@
+{$STATEFUL_DOMAIN} {
+  encode zstd gzip
+
+  basicauth {
+    {$STATEFUL_BASIC_AUTH_USER} {$STATEFUL_BASIC_AUTH_HASH}
+  }
+
+  header {
+    X-Content-Type-Options nosniff
+    Referrer-Policy no-referrer
+    Permissions-Policy "camera=(), microphone=(), geolocation=()"
+  }
+
+  reverse_proxy frontend:80
+}

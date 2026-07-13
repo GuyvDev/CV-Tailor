@@ -189,6 +189,8 @@ function progressLabel(job: JobMetadata | null): string {
 
 const apiBaseUrl = import.meta.env.VITE_API_BASE_URL || "";
 const statelessOnly = import.meta.env.VITE_STATELESS_ONLY === "true";
+const demoVideoUrl = import.meta.env.VITE_DEMO_VIDEO_URL || "/product-walkthrough-20260713.mp4";
+const githubProjectUrl = "https://github.com/GuyvDev/CV-Tailor";
 
 const roleOptions = [
   { label: "General", value: "" },
@@ -694,6 +696,21 @@ export function App() {
           {setupItems.map((item) => (
             <span className={item.done ? "setup-chip done" : "setup-chip"} key={item.label}>{item.done ? "Ready" : "Check"} · {item.label}</span>
           ))}
+        </div>
+      </section>
+
+      <section className="product-proof" aria-label="Stateful Docker and Telegram edition">
+        <div className="product-proof-copy">
+          <p className="eyebrow">Also available: Stateful Docker edition</p>
+          <span className="stateful-only-label">Not part of this Stateless web app</span>
+          <h2>Send a job to Telegram. Get a tailored CV back.</h2>
+          <p>This video shows the self-hosted Stateful edition: Docker, your saved private profile, job history, and an approved Telegram bot. Build it from GitHub when you want that private workflow.</p>
+          <a className="github-link" href={githubProjectUrl} rel="noreferrer" target="_blank">Build the Stateful edition from GitHub</a>
+        </div>
+        <div className="demo-video" aria-label="Stateful Telegram workflow demo">
+          <video controls playsInline preload="metadata" src={demoVideoUrl}>
+            Your browser does not support embedded video.
+          </video>
         </div>
       </section>
 

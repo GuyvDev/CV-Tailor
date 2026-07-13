@@ -71,7 +71,7 @@ def get_settings() -> Settings:
         enable_demo_mode=_as_bool(os.getenv("ENABLE_DEMO_MODE"), default=True),
         app_env=app_env,
         api_auth_token=os.getenv("API_AUTH_TOKEN") or None,
-        require_api_auth=production or _as_bool(os.getenv("REQUIRE_API_AUTH"), default=False),
+        require_api_auth=_as_bool(os.getenv("REQUIRE_API_AUTH"), default=production),
         allowed_origins=_csv(
             allowed_origins
             if allowed_origins is not None

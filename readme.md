@@ -205,6 +205,39 @@ The same behavior is available through:
 - `GET /api/outputs/summary`
 - `POST /api/outputs/cleanup` with `older_than_days`, `include_failed`, `include_stopped`, and `delete_all_terminal`
 
+
+## Stateful Production Docker
+
+The regular `docker-compose.yml` stays as the local/private stateful stack and is not changed by the production setup below. For a stateful production deployment, use the separate Caddy-backed compose file:
+
+```bash
+cp .env.stateful.production.example .env.stateful.production
+# edit domain, Caddy password hash, model keys, and optional Telegram values
+docker compose --env-file .env.stateful.production -f docker-compose.stateful.prod.yml up --build -d
+```
+
+This production stack is isolated from your current running data by default:
+
+- `docker-compose.yml` uses `./data` and `./outputs`.
+- `docker-compose.stateful.prod.yml` uses `./data.prod` and `./outputs.prod` unless you change `STATEFUL_DATA_DIR` or `STATEFUL_OUTPUT_DIR`.
+- The API and Typst compiler ports are not published; Caddy is the only public entrypoint.
+- Caddy protects the entire app with Basic Auth before traffic reaches the frontend/API.
+- API docs are disabled, CORS is same-origin, demo mode is off by default, and the compiler runs read-only with tmpfs.
+
+Generate the Caddy password hash with:
+
+```bash
+docker run --rm caddy:2.8-alpine caddy hash-password --plaintext 'your-long-password'
+```
+
+Put the resulting hash in `STATEFUL_BASIC_AUTH_HASH`. The public Stateless page includes a clearly labeled video showcase for the separate Stateful Docker + Telegram edition. The video is informational only: the Stateless Vercel app does not save profiles, job history, or connect a Telegram bot. To override the showcase video, set `VITE_DEMO_VIDEO_URL` to a public HTTPS MP4 URL before building. To include Telegram in the Stateful stack, add `--profile telegram`:
+
+```bash
+docker compose --env-file .env.stateful.production -f docker-compose.stateful.prod.yml --profile telegram up --build -d
+```
+
+If you intentionally want production to use your current local data, set `STATEFUL_DATA_DIR=./data` and `STATEFUL_OUTPUT_DIR=./outputs`. Otherwise leave the defaults so production cannot alter your local working profile and generated resumes.
+
 ## Telegram Bot Setup
 
 The Telegram bot is optional. It talks to the API service inside Docker and uses the active profile selected in the web UI. Configure the web profile first, then start the bot.

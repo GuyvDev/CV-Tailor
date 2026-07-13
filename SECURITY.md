@@ -14,6 +14,7 @@ This project is intended for local-first use with private resume data and API ke
 
 - Use `docker-compose.stateless.yml` or the Vercel stateless function for public unauthenticated demos.
 - Keep the regular `docker-compose.yml` stack private; it is stateful, mounts profile/output data, and powers the Telegram workflow.
+- For internet-facing stateful Docker, prefer `docker-compose.stateful.prod.yml`; it uses separate production data directories by default and exposes only Caddy with Basic Auth.
 - Do not expose the stateful API unless `APP_ENV=production`, `REQUIRE_API_AUTH=true`, and `API_AUTH_TOKEN` are set, or a reverse proxy/VPN provides equivalent protection.
 - Keep request-body logging disabled because resume and job-description text may be private.
 - Use the Output Retention panel or `/api/outputs/cleanup` to remove generated resume archives that no longer need to be stored.

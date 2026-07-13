@@ -42,3 +42,6 @@ jobs:
 
       - name: Validate stateless Docker Compose
         run: docker compose -f docker-compose.stateless.yml config
+
+      - name: Validate stateful production Docker Compose
+        run: docker compose --env-file .env.stateful.production.example -f docker-compose.stateful.prod.yml config

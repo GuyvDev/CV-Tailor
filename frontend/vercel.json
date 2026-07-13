@@ -5,6 +5,14 @@
       "memory": 2048
     }
   },
+  "headers": [
+    {
+      "source": "/product-walkthrough-20260713.mp4",
+      "headers": [
+        { "key": "Cache-Control", "value": "public, max-age=31536000, immutable" }
+      ]
+    }
+  ],
   "rewrites": [
     {
       "source": "/api/(.*)",
