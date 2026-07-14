@@ -63,6 +63,7 @@ const MAX_RULES_CHARS = 4_000;
 const IP_REQUEST_LIMIT = 5;
 const IP_REQUEST_WINDOW_SECONDS = 60 * 60;
 const DAILY_REQUEST_LIMIT = 100;
+const inMemoryCounters = new Map<string, { count: number; expiresAt: number }>();
 
 type RateLimitDecision = { allowed: true } | { allowed: false; detail: string };
 
@@ -88,15 +89,34 @@ function secondsUntilNextUtcDay() {
   return Math.max(1, Math.ceil((next - now.getTime()) / 1000));
 }
 
+function incrementInMemoryCounter(key: string, ttlSeconds: number) {
+  const now = Date.now();
+  const current = inMemoryCounters.get(key);
+  if (!current || current.expiresAt <= now) {
+    inMemoryCounters.set(key, { count: 1, expiresAt: now + ttlSeconds * 1000 });
+    return 1;
+  }
+  current.count += 1;
+  return current.count;
+}
+
 async function consumeRateLimits(req: any): Promise<RateLimitDecision> {
   const url = process.env.UPSTASH_REDIS_REST_URL?.replace(/\/$/, "");
   const token = process.env.UPSTASH_REDIS_REST_TOKEN;
-  if (!url || !token) {
-    return { allowed: false, detail: "Public generation is temporarily unavailable because rate limiting is not configured." };
-  }
-
   const ipKey = `cv-tailor:stateless:ip:${clientIpFingerprint(req)}`;
   const dayKey = `cv-tailor:stateless:day:${new Date().toISOString().slice(0, 10)}`;
+  const dailyTtlSeconds = secondsUntilNextUtcDay();
+
+  if (!url || !token) {
+    // Local development and an initial Vercel deployment can run without Upstash.
+    // These counters are per warm serverless instance, so they are not a durable global limit.
+    const ipCount = incrementInMemoryCounter(ipKey, IP_REQUEST_WINDOW_SECONDS);
+    if (ipCount > IP_REQUEST_LIMIT) return { allowed: false, detail: "Rate limit reached: up to 5 CV generations per IP address each hour." };
+    const dailyCount = incrementInMemoryCounter(dayKey, dailyTtlSeconds);
+    if (dailyCount > DAILY_REQUEST_LIMIT) return { allowed: false, detail: "Daily site limit reached: up to 100 CV generations per day. Please try again tomorrow." };
+    return { allowed: true };
+  }
+
   try {
     const increment = async (key: string, ttlSeconds: number) => {
       const response = await fetch(`${url}/pipeline`, {
@@ -112,7 +132,7 @@ async function consumeRateLimits(req: any): Promise<RateLimitDecision> {
     };
     const ipCount = await increment(ipKey, IP_REQUEST_WINDOW_SECONDS);
     if (ipCount > IP_REQUEST_LIMIT) return { allowed: false, detail: "Rate limit reached: up to 5 CV generations per IP address each hour." };
-    const dailyCount = await increment(dayKey, secondsUntilNextUtcDay());
+    const dailyCount = await increment(dayKey, dailyTtlSeconds);
     if (dailyCount > DAILY_REQUEST_LIMIT) return { allowed: false, detail: "Daily site limit reached: up to 100 CV generations per day. Please try again tomorrow." };
     return { allowed: true };
   } catch {
