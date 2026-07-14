@@ -191,6 +191,13 @@ const apiBaseUrl = import.meta.env.VITE_API_BASE_URL || "";
 const statelessOnly = import.meta.env.VITE_STATELESS_ONLY === "true";
 const demoVideoUrl = import.meta.env.VITE_DEMO_VIDEO_URL || "/product-walkthrough-20260713.mp4";
 const githubProjectUrl = "https://github.com/GuyvDev/CV-Tailor";
+const marketingCopy = {
+  eyebrow: "AI-powered CV tailoring",
+  headline: "Build a CV that gets you noticed.",
+  supporting: "Paste your experience and a job description. CV Tailor creates a focused, role-specific resume and exports a polished PDF with editable Typst source.",
+  showcaseTitle: "Tailor every application",
+  showcaseText: "CV Tailor evaluates the role, reshapes your strongest verified experience, scores the result, and produces a recruiter-ready resume.",
+};
 
 const roleOptions = [
   { label: "General", value: "" },
@@ -683,18 +690,33 @@ export function App() {
   ];
 
   return (
-    <main className={statelessOnly ? "shell stateless-shell" : "shell"}>
+    <main className={statelessOnly ? "shell stateless-shell" : "shell"} id="top">
+      <header className="site-header">
+        <a className="brand" href="#top" aria-label="CV Tailor home">CV<span>Tailor</span></a>
+        <nav className="site-nav" aria-label="Page sections">
+          <a href="#showcase">How it works</a>
+          <a href="#workspace">Generate</a>
+          <a href="#privacy">Privacy</a>
+        </nav>
+        <a className="header-cta" href="#workspace">Generate your CV</a>
+      </header>
       <section className="hero">
+        <div className="resume-backdrop" aria-hidden="true">
+          <div className="resume-sheet">
+            <span className="resume-kicker">CANDIDATE NAME</span><i /><b>Professional summary</b><em /><em /><b>Selected experience</b><em /><em /><em /><b>Skills &amp; tools</b><em />
+          </div>
+        </div>
         <div className="hero-layout">
           <div className="hero-copy">
             {!statelessOnly ? (
               <div className="hero-topline">
-                <p className="eyebrow">CV Tailor</p>
                 <span className="mode-badge stateful">Private stateful</span>
               </div>
             ) : null}
-            <h1>{statelessOnly ? "Build a CV that gets you noticed." : "Build a CV that helps you land your next job."}</h1>
-            <p className="lede">Paste your information, add a job description, and export a polished PDF with editable Typst source.</p>
+            <p className="eyebrow">{statelessOnly ? marketingCopy.eyebrow : "CV Tailor"}</p>
+            <h1>{statelessOnly ? marketingCopy.headline : "Build a CV that helps you land your next job."}</h1>
+            <p className="lede">{statelessOnly ? marketingCopy.supporting : "Paste your information, add a job description, and export a polished PDF with editable Typst source."}</p>
+            {statelessOnly ? <div className="hero-actions"><a className="primary-link" href="#workspace">Generate your CV <span aria-hidden="true">→</span></a><a className="secondary-link" href="#showcase">View the workflow</a></div> : null}
             {!statelessOnly ? (
               <div className="setup-rail" aria-label="Setup status">
                 {setupItems.map((item) => (
@@ -711,18 +733,26 @@ export function App() {
         </div>
       </section>
 
-      <section className="product-proof" aria-label="Stateful Docker and Telegram edition">
+      <section className="product-proof" id="showcase" aria-label="CV Tailor product walkthrough">
         <div className="product-proof-copy">
-          <h2>Send a job posting through Telegram and receive a tailored CV.</h2>
-          <p>The self-hosted edition lets you securely save your profile and job history and use an approved Telegram bot. Deploy it from GitHub.</p>
+          <p className="eyebrow">See the product in motion</p>
+          <h2>{statelessOnly ? marketingCopy.showcaseTitle : "Send a job posting through Telegram and receive a tailored CV."}</h2>
+          <p>{statelessOnly ? marketingCopy.showcaseText : "The self-hosted edition lets you securely save your profile and job history and use an approved Telegram bot. Deploy it from GitHub."}</p>
           <a className="github-link" href={githubProjectUrl} rel="noreferrer" target="_blank">{statelessOnly ? "Build your Telegram CV bot" : "Build the Stateful edition from GitHub"}</a>
         </div>
         <div className="demo-video" aria-label="Stateful Telegram workflow demo">
           <video controls playsInline preload="metadata" src={demoVideoUrl}>
             Your browser does not support embedded video.
           </video>
+          <div className="video-overlay"><span>CV Tailor</span><strong>From role brief to polished resume.</strong></div>
         </div>
       </section>
+
+      {statelessOnly ? <section className="benefit-grid" aria-label="Core CV Tailor benefits">
+        <article><span className="benefit-number">01</span><h2>Tailored to the role</h2><p>Matches your verified experience to the role’s actual needs.</p></article>
+        <article><span className="benefit-number">02</span><h2>Scored before export</h2><p>Reviews quality, keyword alignment, recruiter clarity, and one-page fit.</p></article>
+        <article><span className="benefit-number">03</span><h2>PDF and editable source</h2><p>Exports a finished PDF and editable Typst source.</p></article>
+      </section> : null}
 
       {!statelessOnly ? (
         <nav className="tabs" aria-label="Workspace views">
@@ -842,7 +872,7 @@ export function App() {
         </div>
       ) : activeView === "stateless" ? (
         <>
-          <section className="workflow-strip" aria-label="Stateless CV workflow">
+          <section className="workflow-strip" id="privacy" aria-label="Stateless CV workflow">
             <div>
               <span>1</span>
               <strong>Prepare information</strong>
@@ -859,7 +889,7 @@ export function App() {
               <p>Add the role and download the result.</p>
             </div>
           </section>
-          <section className="panel">
+          <section className="panel stateless-prep-panel" id="workspace">
             <div className="form">
               <div className="notice privacy-note">
                 <strong>Stateless demo:</strong> pasted CV data is used for this generation only. No server profile, job history, or output archive is created. For maximum privacy, run the GitHub project locally or use the included Telegram bot workflow on your own machine.
@@ -894,7 +924,7 @@ export function App() {
             </div>
           </section>
 
-          <section className="panel">
+          <section className="panel stateless-generate-panel">
             <form className="form" onSubmit={generateStateless}>
               <div className="result-header">
                 <h2>Generate Tailored CV</h2>
