@@ -51,12 +51,87 @@ type ScoreReport = {
   revision_brief: string;
 };
 
-const MAX_PAYLOAD_BYTES = 4_000_000;
+const MAX_PAYLOAD_BYTES = 128_000;
 const MAX_OUTPUT_BYTES = 4_300_000;
+const MAX_GENERATION_OUTPUT_TOKENS = 5_000;
+const MAX_SCORE_OUTPUT_TOKENS = 1_000;
+const MAX_CANDIDATE_CHARS = 16_000;
+const MAX_JOB_DESCRIPTION_CHARS = 16_000;
+const MAX_PROJECTS_CHARS = 12_000;
+const MAX_SKILLS_CHARS = 8_000;
+const MAX_RULES_CHARS = 4_000;
+const IP_REQUEST_LIMIT = 5;
+const IP_REQUEST_WINDOW_SECONDS = 60 * 60;
+const DAILY_REQUEST_LIMIT = 100;
+
+type RateLimitDecision = { allowed: true } | { allowed: false; detail: string };
 
 function jsonResponse(res: any, status: number, payload: unknown) {
   res.status(status).setHeader("Content-Type", "application/json");
   res.send(JSON.stringify(payload));
+}
+
+function clientIpFingerprint(req: any) {
+  const forwarded = String(req.headers["x-forwarded-for"] || "").split(",")[0].trim();
+  const value = forwarded || String(req.headers["x-real-ip"] || "unknown");
+  let hash = 2166136261;
+  for (let index = 0; index < value.length; index += 1) {
+    hash ^= value.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 0).toString(36);
+}
+
+function secondsUntilNextUtcDay() {
+  const now = new Date();
+  const next = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + 1);
+  return Math.max(1, Math.ceil((next - now.getTime()) / 1000));
+}
+
+async function consumeRateLimits(req: any): Promise<RateLimitDecision> {
+  const url = process.env.UPSTASH_REDIS_REST_URL?.replace(/\/$/, "");
+  const token = process.env.UPSTASH_REDIS_REST_TOKEN;
+  if (!url || !token) {
+    return { allowed: false, detail: "Public generation is temporarily unavailable because rate limiting is not configured." };
+  }
+
+  const ipKey = `cv-tailor:stateless:ip:${clientIpFingerprint(req)}`;
+  const dayKey = `cv-tailor:stateless:day:${new Date().toISOString().slice(0, 10)}`;
+  try {
+    const increment = async (key: string, ttlSeconds: number) => {
+      const response = await fetch(`${url}/pipeline`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+        body: JSON.stringify([["INCR", key], ["EXPIRE", key, ttlSeconds, "NX"]]),
+      });
+      if (!response.ok) throw new Error("counter store unavailable");
+      const results = await response.json();
+      const count = Number(results?.[0]?.result);
+      if (!Number.isFinite(count)) throw new Error("invalid counter response");
+      return count;
+    };
+    const ipCount = await increment(ipKey, IP_REQUEST_WINDOW_SECONDS);
+    if (ipCount > IP_REQUEST_LIMIT) return { allowed: false, detail: "Rate limit reached: up to 5 CV generations per IP address each hour." };
+    const dailyCount = await increment(dayKey, secondsUntilNextUtcDay());
+    if (dailyCount > DAILY_REQUEST_LIMIT) return { allowed: false, detail: "Daily site limit reached: up to 100 CV generations per day. Please try again tomorrow." };
+    return { allowed: true };
+  } catch {
+    return { allowed: false, detail: "Public generation is temporarily unavailable because the rate-limit service could not be reached." };
+  }
+}
+
+function validateInputSize(body: any): string | null {
+  const limits: Array<[string, unknown, number]> = [
+    ["Candidate profile", body?.candidate_profile, MAX_CANDIDATE_CHARS],
+    ["Job description", body?.job_description, MAX_JOB_DESCRIPTION_CHARS],
+    ["Projects JSON", body?.projects_json, MAX_PROJECTS_CHARS],
+    ["Skills JSON", body?.skills_json, MAX_SKILLS_CHARS],
+    ["Generation rules", body?.rules, MAX_RULES_CHARS],
+  ];
+  for (const [label, value, maxLength] of limits) {
+    if (typeof value === "string" && value.length > maxLength) return `${label} is too long (maximum ${maxLength.toLocaleString()} characters).`;
+  }
+  return null;
 }
 
 function safePart(value: string, maxLen = 80) {
@@ -251,13 +326,15 @@ Draft JSON:
 ${JSON.stringify(draft)}`;
 }
 
-async function callGemini(prompt: string, apiKey: string) {
+async function callGemini(prompt: string, apiKey: string, maxTokens: number) {
   const response = await fetch("https://generativelanguage.googleapis.com/v1beta/openai/chat/completions", {
     method: "POST",
     headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
     body: JSON.stringify({
       model: process.env.STATELESS_MODEL_NAME || "gemini-2.5-flash",
       stream: false,
+      // OpenAI-compatible name for Gemini's maximum output-token setting.
+      max_tokens: maxTokens,
       response_format: { type: "json_object" },
       messages: [
         { role: "system", content: "You are a precise resume tailoring engine. Return valid JSON only." },
@@ -292,12 +369,16 @@ export default async function handler(req: any, res: any) {
     const body = typeof req.body === "string" ? JSON.parse(req.body) : req.body;
     if (!body?.candidate_profile || body.candidate_profile.length < 20) return jsonResponse(res, 422, { detail: "candidate_profile is required." });
     if (!body?.job_description || body.job_description.length < 20) return jsonResponse(res, 422, { detail: "job_description is required." });
+    const sizeError = validateInputSize(body);
+    if (sizeError) return jsonResponse(res, 413, { detail: sizeError });
     const apiKey = process.env.FLASH_API_KEY;
     if (!apiKey) return jsonResponse(res, 500, { detail: "FLASH_API_KEY is not configured." });
+    const rateLimit = await consumeRateLimits(req);
+    if (!rateLimit.allowed) return jsonResponse(res, 429, { detail: rateLimit.detail });
 
     let draft: Draft;
     try {
-      draft = await callGemini(generationPrompt(body), apiKey) as Draft;
+      draft = await callGemini(generationPrompt(body), apiKey, MAX_GENERATION_OUTPUT_TOKENS) as Draft;
     } catch (error) {
       draft = fallbackDraft(body);
     }
@@ -307,7 +388,7 @@ export default async function handler(req: any, res: any) {
 
     let scoreReport: ScoreReport | null = null;
     try {
-      scoreReport = await callGemini(scorePrompt(body, draft), apiKey) as ScoreReport;
+      scoreReport = await callGemini(scorePrompt(body, draft), apiKey, MAX_SCORE_OUTPUT_TOKENS) as ScoreReport;
     } catch {
       scoreReport = null;
     }

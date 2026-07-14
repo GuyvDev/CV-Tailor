@@ -111,5 +111,7 @@ body:has(.stateless-shell) { background:#09090b; }
 .stateless-shell .notice.privacy-note strong { color:#fafafa; }
 .stateless-shell textarea,.stateless-shell select,.stateless-shell input { border-color:rgba(255,255,255,.14); border-radius:8px; background:#18181b; }
 .stateless-shell .panel.result { margin-top:24px; padding:28px; border:1px solid rgba(255,255,255,.08); border-radius:12px; background:#18181b; }
+.stateless-shell .field-error,.stateless-shell .generation-error { margin:0; color:#fca5a5; font-size:.88rem; }
+.stateless-shell .generation-error { margin-top:-6px; }
 .stateless-shell button { border-radius:8px; }
 @media (max-width:680px) { .stateless-shell .hero { padding:56px 0 48px; } .stateless-shell .hero h1 { margin-top:28px; font-size:clamp(40px,11vw,56px); } .stateless-shell .product-proof { padding-bottom:64px; } .stateless-shell .benefit-grid,.stateless-shell .workflow-strip { grid-template-columns:1fr; margin-bottom:48px; } .stateless-shell .benefit-grid article + article,.stateless-shell .workflow-strip div + div { border-top:1px solid rgba(255,255,255,.08); border-left:0; } .stateless-shell .workflow-strip { margin-top:52px; } }

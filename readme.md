@@ -144,6 +144,8 @@ Set these Vercel environment variables:
 FLASH_API_KEY=your-google-ai-studio-key
 STATELESS_MODEL_NAME=gemini-2.5-flash
 VITE_STATELESS_ONLY=true
+UPSTASH_REDIS_REST_URL=your-upstash-rest-url
+UPSTASH_REDIS_REST_TOKEN=your-upstash-rest-token
 ```
 
 Recommended Vercel settings:
@@ -153,7 +155,7 @@ Recommended Vercel settings:
 - Output Directory: `dist`
 - Install Command: `npm install`
 
-The Vercel path is fully stateless: the function returns the PDF and Typst source in the JSON response and does not create profiles, jobs, or output files. Keep request-body logging disabled and add rate limiting/abuse protection before sharing the URL widely.
+The Vercel path is fully stateless: the function returns the PDF and Typst source in the JSON response and does not create profiles, jobs, or output files. It requires the Upstash Redis variables above before public generation is allowed. The function enforces 5 valid generation starts per IP address per hour, 100 valid generation starts per UTC day across the site, a 128 KB request limit, per-field character limits, a 5,000-token ceiling for CV drafting, and a 1,000-token ceiling for scoring. The rate-limit store contains only hashed IP identifiers and numeric counters; it does not receive CV content. Keep request-body logging disabled and also configure a matching Vercel Firewall IP rate-limit rule before sharing the URL widely.
 
 ## Stateless VPS Deployment
 

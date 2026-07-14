@@ -269,6 +269,7 @@ export function App() {
   const [isDraftingProfile, setIsDraftingProfile] = useState(false);
   const [statelessPreparedJson, setStatelessPreparedJson] = useState("");
   const [statelessPreparedStatus, setStatelessPreparedStatus] = useState<string | null>(null);
+  const [statelessPreparedError, setStatelessPreparedError] = useState<string | null>(null);
   const [statelessCandidate, setStatelessCandidate] = useState("");
   const [statelessProjects, setStatelessProjects] = useState("[]");
   const [statelessSkills, setStatelessSkills] = useState("{}");
@@ -573,7 +574,7 @@ export function App() {
   }
 
   function loadPreparedCvData() {
-    setStatelessError(null);
+    setStatelessPreparedError(null);
     setStatelessPreparedStatus(null);
     try {
       const payload = JSON.parse(statelessPreparedJson);
@@ -585,7 +586,7 @@ export function App() {
       setStatelessRules(String(payload.rules || "Keep every bullet factual and grounded in the candidate input. Do not invent employers, metrics, dates, degrees, or tools."));
       setStatelessPreparedStatus("Prepared CV data loaded. Review it below, then paste a job description and generate.");
     } catch (parseError) {
-      setStatelessError(parseError instanceof Error ? `Prepared JSON is invalid: ${parseError.message}` : "Prepared JSON is invalid.");
+      setStatelessPreparedError(parseError instanceof Error ? `Prepared JSON is invalid: ${parseError.message}` : "Prepared JSON is invalid.");
     }
   }
 
@@ -593,6 +594,7 @@ export function App() {
     event.preventDefault();
     setIsGeneratingStateless(true);
     setStatelessError(null);
+    setStatelessPreparedError(null);
     setStatelessResult(null);
     try {
       const response = await fetch(`${apiBaseUrl}/api/stateless/generate`, {
@@ -918,6 +920,7 @@ export function App() {
                     placeholder="Paste the JSON returned by your AI here. It should include candidate_profile, projects_json, skills_json, and rules."
                   />
                 </label>
+                {statelessPreparedError ? <p className="error field-error" role="alert">{statelessPreparedError}</p> : null}
                 <button className="small-button" disabled={statelessPreparedJson.trim().length < 20} type="button" onClick={loadPreparedCvData}>Load prepared data</button>
                 {statelessPreparedStatus ? <p className="success">{statelessPreparedStatus}</p> : null}
               </div>
@@ -971,6 +974,7 @@ export function App() {
               <button disabled={isGeneratingStateless || statelessCandidate.trim().length < 20 || statelessJob.trim().length < 20} type="submit">
                 {isGeneratingStateless ? "Generating..." : "Generate PDF"}
               </button>
+              {statelessError ? <p className="error generation-error" role="alert">{statelessError}</p> : null}
             </form>
           </section>
 
@@ -979,7 +983,6 @@ export function App() {
               <h2>Stateless result</h2>
               {statelessResult ? <span className="badge badge-completed">{statelessResult.model_name}</span> : null}
             </div>
-            {statelessError ? <p className="error">{statelessError}</p> : null}
             {!statelessResult && !statelessError ? <p className="muted">No stateless CV generated yet.</p> : null}
             {statelessResult ? (
               <div className="result-body">
