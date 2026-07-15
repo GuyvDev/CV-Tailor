@@ -85,6 +85,9 @@ body:has(.stateless-shell) { background:#09090b; }
 .stateless-shell .primary-link:hover { color:#09090b; background:#fff; }
 .stateless-shell .primary-link span { color:inherit; }
 .stateless-shell .secondary-link { color:#a1a1aa; font-size:14px; font-weight:500; text-decoration:none; }
+.stateless-shell .github-hero-link { display:inline-flex; min-height:38px; align-items:center; gap:8px; padding:8px 11px; border:1px solid #fafafa; border-radius:8px; color:#09090b; background:#fafafa; font-size:13px; transition:border-color .18s ease,background .18s ease,transform .18s ease; }
+.stateless-shell .github-hero-link svg { width:18px; height:18px; }
+.stateless-shell .github-hero-link:hover { border-color:#fff; background:#fff; color:#09090b; transform:translateY(-1px); }
 .stateless-shell .resume-backdrop { display:none; }
 .stateless-shell .product-proof { padding:0 0 96px; border:0; }
 .stateless-shell .product-proof-copy { display:block; margin:0 0 28px; text-align:left; }
@@ -94,12 +97,24 @@ body:has(.stateless-shell) { background:#09090b; }
 .stateless-shell .demo-video::before { display:none; }
 .stateless-shell .video-overlay { display:none; }
 .stateless-shell .benefit-grid,.stateless-shell .workflow-strip { display:grid; grid-template-columns:repeat(3,1fr); gap:0; margin:0 0 64px; border:1px solid rgba(255,255,255,.08); border-radius:12px; overflow:hidden; }
+.stateless-shell .benefit-grid { grid-template-columns:repeat(4,1fr); }
 .stateless-shell .benefit-grid article,.stateless-shell .workflow-strip div { min-height:0; padding:22px 20px; border:0; border-radius:0; background:linear-gradient(180deg,rgba(255,255,255,.015),transparent); }
 .stateless-shell .benefit-grid article + article,.stateless-shell .workflow-strip div + div { border-left:1px solid rgba(255,255,255,.08); }
 .stateless-shell .benefit-number,.stateless-shell .workflow-strip span { display:none; }
 .stateless-shell .benefit-grid h2,.stateless-shell .workflow-strip strong { margin:0 0 3px; color:#fafafa; font-size:14px; font-weight:500; letter-spacing:-.01em; }
 .stateless-shell .benefit-grid p,.stateless-shell .workflow-strip p { max-width:none; margin:0; color:#71717a; font-family:"JetBrains Mono",ui-monospace,monospace; font-size:11px; line-height:1.45; }
 .stateless-shell .benefit-grid article,.stateless-shell .workflow-strip div { display:flex; flex-direction:column; align-items:center; justify-content:center; text-align:center; }
+.stateless-shell .benefit-grid article { justify-content:flex-start; padding-top:28px; }
+.stateless-shell .benefit-grid article { min-height:176px; gap:0; transition:background .18s ease; }
+.stateless-shell .benefit-grid article:hover { background:rgba(255,255,255,.035); }
+.stateless-shell .capability-icon { display:grid; width:38px; height:38px; place-items:center; margin-bottom:14px; border:1px solid rgba(139,139,245,.45); border-radius:10px; color:#b7b7ff; background:rgba(139,139,245,.1); }
+.stateless-shell .capability-icon svg { width:20px; height:20px; fill:none; stroke:currentColor; stroke-linecap:round; stroke-linejoin:round; stroke-width:1.6; }
+.stateless-shell .benefit-grid article:nth-child(1) .capability-icon { color:#c4b5fd; border-color:rgba(196,181,253,.65); background:rgba(139,92,246,.18); box-shadow:0 0 24px rgba(139,92,246,.2); }
+.stateless-shell .benefit-grid article:nth-child(2) .capability-icon { color:#f0abfc; border-color:rgba(240,171,252,.65); background:rgba(217,70,239,.16); box-shadow:0 0 24px rgba(217,70,239,.18); }
+.stateless-shell .benefit-grid article:nth-child(3) .capability-icon { color:#67e8f9; border-color:rgba(103,232,249,.65); background:rgba(6,182,212,.16); box-shadow:0 0 24px rgba(6,182,212,.18); }
+.stateless-shell .benefit-grid article:nth-child(4) .capability-icon { color:#86efac; border-color:rgba(134,239,172,.65); background:rgba(34,197,94,.14); box-shadow:0 0 24px rgba(34,197,94,.16); }
+.stateless-shell .benefit-grid h2 { max-width:18ch; }
+.stateless-shell .benefit-grid p { max-width:30ch; }
 .stateless-shell .prompt-helper textarea[readonly] { color:#e4e4e7; border-color:rgba(255,255,255,.16); background:#18181b; }
 .stateless-shell .prompt-helper textarea[readonly]:focus { border-color:rgba(255,255,255,.28); box-shadow:0 0 0 3px rgba(255,255,255,.08); }
 .stateless-shell .workflow-strip { margin-top:72px; margin-bottom:0; }
@@ -111,7 +126,9 @@ body:has(.stateless-shell) { background:#09090b; }
 .stateless-shell .notice.privacy-note strong { color:#fafafa; }
 .stateless-shell textarea,.stateless-shell select,.stateless-shell input { border-color:rgba(255,255,255,.14); border-radius:8px; background:#18181b; }
 .stateless-shell .panel.result { margin-top:24px; padding:28px; border:1px solid rgba(255,255,255,.08); border-radius:12px; background:#18181b; }
+.stateless-shell .pdf-preview { width:min(100%, 680px); height:auto; min-height:0; aspect-ratio:8.5 / 11; margin:22px auto 0; border-radius:8px; }
+.stateless-shell .pdf-preview iframe { height:100%; }
 .stateless-shell .field-error,.stateless-shell .generation-error { margin:0; color:#fca5a5; font-size:.88rem; }
 .stateless-shell .generation-error { margin-top:-6px; }
 .stateless-shell button { border-radius:8px; }
-@media (max-width:680px) { .stateless-shell .hero { padding:56px 0 48px; } .stateless-shell .hero h1 { margin-top:28px; font-size:clamp(40px,11vw,56px); } .stateless-shell .product-proof { padding-bottom:64px; } .stateless-shell .benefit-grid,.stateless-shell .workflow-strip { grid-template-columns:1fr; margin-bottom:48px; } .stateless-shell .benefit-grid article + article,.stateless-shell .workflow-strip div + div { border-top:1px solid rgba(255,255,255,.08); border-left:0; } .stateless-shell .workflow-strip { margin-top:52px; } }
+@media (max-width:680px) { .stateless-shell .hero { padding:56px 0 48px; } .stateless-shell .hero h1 { margin-top:28px; font-size:clamp(40px,11vw,56px); } .stateless-shell .product-proof { padding-bottom:64px; } .stateless-shell .benefit-grid,.stateless-shell .workflow-strip { grid-template-columns:1fr; margin-bottom:48px; } .stateless-shell .benefit-grid article + article,.stateless-shell .workflow-strip div + div { border-top:1px solid rgba(255,255,255,.08); border-left:0; } .stateless-shell .workflow-strip { margin-top:52px; } .stateless-shell .pdf-preview { width:100%; } }

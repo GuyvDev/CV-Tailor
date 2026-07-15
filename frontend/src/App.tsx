@@ -245,6 +245,17 @@ const emptyProfile: ProfileBundle = {
   template_exists: false,
 };
 
+function GitHubIcon() {
+  return <svg aria-hidden="true" viewBox="0 0 24 24"><path d="M12 2.5a9.5 9.5 0 0 0-3 18.51c.48.09.65-.21.65-.46v-1.67c-2.65.58-3.21-1.13-3.21-1.13-.43-1.1-1.06-1.4-1.06-1.4-.87-.59.07-.58.07-.58.96.07 1.47.99 1.47.99.86 1.47 2.25 1.05 2.8.8.09-.62.34-1.05.61-1.29-2.12-.24-4.35-1.06-4.35-4.72 0-1.04.37-1.89.98-2.56-.1-.24-.42-1.21.09-2.52 0 0 .8-.26 2.61.98A9.05 9.05 0 0 1 12 6.62c.8 0 1.6.11 2.35.32 1.8-1.24 2.6-.98 2.6-.98.52 1.31.2 2.28.1 2.52.6.67.97 1.52.97 2.56 0 3.67-2.24 4.47-4.37 4.71.35.3.65.87.65 1.75v2.59c0 .25.17.55.66.46A9.5 9.5 0 0 0 12 2.5Z" fill="currentColor" /></svg>;
+}
+
+function CapabilityIcon({ type }: { type: "target" | "message" | "score" | "file" }) {
+  if (type === "target") return <svg aria-hidden="true" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5" /><circle cx="12" cy="12" r="3.5" /><path d="M12 1v3M12 20v3M1 12h3M20 12h3" /></svg>;
+  if (type === "message") return <svg aria-hidden="true" viewBox="0 0 24 24"><path d="M20 11.5a7.5 7.5 0 0 1-8 7.48 9.2 9.2 0 0 1-3.4-.66L4 20l1.49-3.71A7.38 7.38 0 0 1 4 11.5 7.5 7.5 0 0 1 12 4a7.5 7.5 0 0 1 8 7.5Z" /><path d="M8.5 11.5h.01M12 11.5h.01M15.5 11.5h.01" /></svg>;
+  if (type === "score") return <svg aria-hidden="true" viewBox="0 0 24 24"><path d="M4 19.5V13M10 19.5V8M16 19.5V4M22 19.5H2" /><path d="m4 9 5-4 4 2 6-5" /></svg>;
+  return <svg aria-hidden="true" viewBox="0 0 24 24"><path d="M6 2.75h8l4 4V21.25H6z" /><path d="M14 2.75v4h4M9 12h6M9 16h6" /></svg>;
+}
+
 export function App() {
   const [activeView, setActiveView] = useState<"generate" | "stateless" | "personalize">(statelessOnly ? "stateless" : "generate");
   const [jobDescription, setJobDescription] = useState("");
@@ -718,7 +729,7 @@ export function App() {
             <p className="eyebrow">{statelessOnly ? marketingCopy.eyebrow : "CV Tailor"}</p>
             <h1>{statelessOnly ? marketingCopy.headline : "Build a CV that helps you land your next job."}</h1>
             <p className="lede">{statelessOnly ? marketingCopy.supporting : "Paste your information, add a job description, and export a polished PDF with editable Typst source."}</p>
-            {statelessOnly ? <div className="hero-actions"><a className="primary-link" href="#workspace">Generate your CV <span aria-hidden="true">→</span></a><a className="secondary-link" href="#showcase">View the workflow</a></div> : null}
+            {statelessOnly ? <div className="hero-actions"><a className="primary-link" href="#workspace">Generate your CV <span aria-hidden="true">→</span></a><a className="secondary-link github-hero-link" href={githubProjectUrl} rel="noreferrer" target="_blank"><GitHubIcon /><span>Workflow with Telegram bot</span></a></div> : null}
             {!statelessOnly ? (
               <div className="setup-rail" aria-label="Setup status">
                 {setupItems.map((item) => (
@@ -751,9 +762,10 @@ export function App() {
       </section>
 
       {statelessOnly ? <section className="benefit-grid" aria-label="Core CV Tailor benefits">
-        <article><span className="benefit-number">01</span><h2>Tailored to the role</h2><p>Matches your verified experience to the role’s actual needs.</p></article>
-        <article><span className="benefit-number">02</span><h2>Scored before export</h2><p>Reviews quality, keyword alignment, recruiter clarity, and one-page fit.</p></article>
-        <article><span className="benefit-number">03</span><h2>PDF and editable source</h2><p>Exports a finished PDF and editable Typst source.</p></article>
+        <article><span className="capability-icon"><CapabilityIcon type="target" /></span><h2>Tailored to the role</h2><p>Matches your verified experience to the role’s actual needs.</p></article>
+        <article><span className="capability-icon"><CapabilityIcon type="message" /></span><h2>Edit in plain language</h2><p>The private Telegram workflow lets you ask for CV revisions naturally, then returns an updated version.</p></article>
+        <article><span className="capability-icon"><CapabilityIcon type="score" /></span><h2>Scored before export</h2><p>Reviews quality, keyword alignment, recruiter clarity, and one-page fit.</p></article>
+        <article><span className="capability-icon"><CapabilityIcon type="file" /></span><h2>PDF and editable source</h2><p>Exports a finished PDF and editable Typst source.</p></article>
       </section> : null}
 
       {!statelessOnly ? (
@@ -997,7 +1009,7 @@ export function App() {
                   <a href="https://typst.app/play/" rel="noreferrer" target="_blank">Open Typst playground</a>
                 </div>
                 <div className="pdf-preview">
-                  <iframe title="Stateless CV preview" src={`data:application/pdf;base64,${statelessResult.pdf_base64}`} />
+                  <iframe title="Stateless CV preview" src={`data:application/pdf;base64,${statelessResult.pdf_base64}#view=FitH&toolbar=0&navpanes=0&scrollbar=0`} />
                 </div>
                 {statelessResult.compile_logs.length > 0 ? <pre className="inline-log">{statelessResult.compile_logs.join("\n")}</pre> : null}
               </div>

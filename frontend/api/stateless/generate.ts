@@ -419,7 +419,7 @@ export default async function handler(req: any, res: any) {
       page_count: 1,
       draft,
       score_report: scoreReport,
-      compile_logs: [`vercel: pdf_bytes=${pdfBuffer.byteLength}`],
+      compile_logs: [],
       output_basename: safePart(body.output_basename || "tailored-resume"),
       model_name: process.env.STATELESS_MODEL_NAME || "gemini-2.5-flash",
     });
