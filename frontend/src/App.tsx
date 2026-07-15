@@ -1022,7 +1022,7 @@ export function App() {
               <div className="result-body">
                 <p><strong>Page count:</strong> {statelessResult.page_count}</p>
                 {statelessResult.score_report ? (
-                  <div className="gemini-review"><p><strong>Gemini score:</strong> Quality {statelessResult.score_report.quality_score}/100 | Match {statelessResult.score_report.match_score}/100 | {statelessResult.score_report.score_band}</p>{statelessResult.score_report.summary ? <p><strong>Gemini review:</strong> {statelessResult.score_report.summary}</p> : null}</div>
+                  <div className="gemini-review"><p><strong>Gemini score:</strong> Quality: {statelessResult.score_report.quality_score}/100 | Match: {statelessResult.score_report.match_score}/100 | Band: {statelessResult.score_report.score_band}</p>{statelessResult.score_report.summary ? <p><strong>Gemini review:</strong> {statelessResult.score_report.summary}</p> : null}</div>
                 ) : null}
                 {!statelessResult.score_report && statelessResult.fit_summary ? <p><strong>Generation summary:</strong> {statelessResult.fit_summary}</p> : null}
                 {statelessResult.score_error ? <p className="muted">{statelessResult.score_error}</p> : null}

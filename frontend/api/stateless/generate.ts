@@ -339,6 +339,8 @@ ${body.job_description}`;
 function scorePrompt(body: any, draft: Draft) {
   return `Score this generated CV for the job. Return one JSON object with: quality_score number 0-100, match_score number 0-100, score_band string, decision approve or revise, summary string, strengths array, gaps array, recommendations array, revision_brief string.
 
+Set score_band to exactly one of: "Strong" (85-100), "Good" (70-84), or "Moderate" (0-69), based on the lower of quality_score and match_score.
+
 Job description:
 ${body.job_description}
 
