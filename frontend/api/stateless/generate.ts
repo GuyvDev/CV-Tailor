@@ -341,6 +341,8 @@ function scorePrompt(body: any, draft: Draft) {
 
 Set score_band to exactly one of: "Strong" (85-100), "Good" (70-84), or "Moderate" (0-69), based on the lower of quality_score and match_score.
 
+Keep the response compact: summary is at most two short sentences; strengths, gaps, and recommendations have at most three items each; each item is at most twelve words; revision_brief is one sentence. Do not include markdown.
+
 Job description:
 ${body.job_description}
 
@@ -350,20 +352,40 @@ ${JSON.stringify(draft)}`;
 
 async function callGemini(prompt: string, apiKey: string, maxTokens: number) {
   const model = process.env.STATELESS_MODEL_NAME || "gemini-2.5-flash";
+  const generationConfig: Record<string, unknown> = { responseMimeType: "application/json", maxOutputTokens: maxTokens };
+  // The score is deliberately concise. Disable 2.5 Flash thinking so its small
+  // response budget is reserved for the required JSON rather than hidden reasoning.
+  if (model.startsWith("gemini-2.5-flash")) generationConfig.thinkingConfig = { thinkingBudget: 0 };
   const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(apiKey)}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       systemInstruction: { parts: [{ text: "You are a precise resume tailoring engine. Return valid JSON only." }] },
       contents: [{ role: "user", parts: [{ text: prompt }] }],
-      generationConfig: { responseMimeType: "application/json", maxOutputTokens: maxTokens },
+      generationConfig,
     }),
   });
-  if (!response.ok) throw new Error(`Gemini request failed: ${response.status} ${await response.text()}`);
+  if (!response.ok) throw new Error(`Gemini request failed with status ${response.status}.`);
   const payload = await response.json();
-  const content = payload?.candidates?.[0]?.content?.parts?.map((part: { text?: string }) => part.text || "").join("");
+  const candidate = payload?.candidates?.[0];
+  if (candidate?.finishReason && candidate.finishReason !== "STOP") {
+    throw new Error(`Gemini ended the response early (${candidate.finishReason}).`);
+  }
+  const content = candidate?.content?.parts?.map((part: { text?: string }) => part.text || "").join("");
   if (!content) throw new Error("Gemini returned an empty response.");
-  return JSON.parse(content);
+  try {
+    return JSON.parse(content);
+  } catch {
+    throw new Error("Gemini returned an incomplete JSON response.");
+  }
+}
+
+function safeScoreError(error: unknown) {
+  const message = error instanceof Error ? error.message : "";
+  if (message.includes("status 429")) return "Gemini scoring is busy right now. Please try again shortly.";
+  if (message.includes("MAX_TOKENS") || message.includes("incomplete JSON")) return "Gemini scoring reached its response limit. Please generate again.";
+  if (message.includes("SAFETY")) return "Gemini could not score this content for this run.";
+  return "Gemini scoring was temporarily unavailable for this run.";
 }
 
 async function compileTypst(source: string) {
@@ -407,8 +429,8 @@ export default async function handler(req: any, res: any) {
     let scoreError: string | null = null;
     try {
       scoreReport = await callGemini(scorePrompt(body, draft), apiKey, MAX_SCORE_OUTPUT_TOKENS) as ScoreReport;
-    } catch {
-      scoreError = "Gemini scoring was unavailable for this run.";
+    } catch (error) {
+      scoreError = safeScoreError(error);
     }
 
     return jsonResponse(res, 200, {
