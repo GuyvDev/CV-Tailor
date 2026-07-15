@@ -105,6 +105,8 @@ type StatelessGenerateResponse = {
   page_count: number;
   draft: unknown;
   score_report?: ScoreReport | null;
+  score_error?: string | null;
+  fit_summary?: string | null;
   compile_logs: string[];
   output_basename: string;
   model_name: string;
@@ -291,6 +293,7 @@ export function App() {
   const [statelessResult, setStatelessResult] = useState<StatelessGenerateResponse | null>(null);
   const [statelessError, setStatelessError] = useState<string | null>(null);
   const [isGeneratingStateless, setIsGeneratingStateless] = useState(false);
+  const [statelessGenerationStep, setStatelessGenerationStep] = useState(0);
   const [outputSummary, setOutputSummary] = useState<OutputSummary | null>(null);
   const [cleanupDays, setCleanupDays] = useState(30);
   const [cleanupStatus, setCleanupStatus] = useState<string | null>(null);
@@ -604,6 +607,7 @@ export function App() {
   async function generateStateless(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     setIsGeneratingStateless(true);
+    setStatelessGenerationStep(0);
     setStatelessError(null);
     setStatelessPreparedError(null);
     setStatelessResult(null);
@@ -634,6 +638,14 @@ export function App() {
       setIsGeneratingStateless(false);
     }
   }
+
+  useEffect(() => {
+    if (!isGeneratingStateless) return;
+    const timer = window.setInterval(() => {
+      setStatelessGenerationStep((step) => Math.min(step + 1, 4));
+    }, 1800);
+    return () => window.clearInterval(timer);
+  }, [isGeneratingStateless]);
 
 
   function formatBytes(value: number): string {
@@ -700,6 +712,13 @@ export function App() {
     { value: profile.exists ? "Ready" : "New", label: "Profile" },
     { value: String(job?.quality_score ?? "AI"), label: "Quality" },
     { value: String(job?.page_count ?? 1), label: "Page goal" },
+  ];
+  const statelessGenerationSteps = [
+    "Checking your CV data",
+    "Matching experience to the role",
+    "Building the one-page CV",
+    "Reviewing fit and clarity",
+    "Preparing PDF and Typst",
   ];
 
   return (
@@ -987,6 +1006,9 @@ export function App() {
                 {isGeneratingStateless ? "Generating..." : "Generate PDF"}
               </button>
               {statelessError ? <p className="error generation-error" role="alert">{statelessError}</p> : null}
+              {isGeneratingStateless ? <ol className="generation-timeline" aria-live="polite" aria-label="Generation progress">
+                {statelessGenerationSteps.map((step, index) => <li className={index < statelessGenerationStep ? "complete" : index === statelessGenerationStep ? "active" : ""} key={step}><span aria-hidden="true">{index < statelessGenerationStep ? "✓" : ""}</span>{step}</li>)}
+              </ol> : null}
             </form>
           </section>
 
@@ -1000,9 +1022,10 @@ export function App() {
               <div className="result-body">
                 <p><strong>Page count:</strong> {statelessResult.page_count}</p>
                 {statelessResult.score_report ? (
-                  <p><strong>Score:</strong> Quality {statelessResult.score_report.quality_score}/100 | Match {statelessResult.score_report.match_score}/100 | {statelessResult.score_report.score_band}</p>
+                  <div className="gemini-review"><p><strong>Gemini score:</strong> Quality {statelessResult.score_report.quality_score}/100 | Match {statelessResult.score_report.match_score}/100 | {statelessResult.score_report.score_band}</p>{statelessResult.score_report.summary ? <p><strong>Gemini review:</strong> {statelessResult.score_report.summary}</p> : null}</div>
                 ) : null}
-                {statelessResult.score_report?.summary ? <p><strong>Review:</strong> {statelessResult.score_report.summary}</p> : null}
+                {!statelessResult.score_report && statelessResult.fit_summary ? <p><strong>Generation summary:</strong> {statelessResult.fit_summary}</p> : null}
+                {statelessResult.score_error ? <p className="muted">{statelessResult.score_error}</p> : null}
                 <div className="downloads">
                   <button className="small-button" type="button" onClick={() => downloadBase64File(`${statelessResult.output_basename}.pdf`, statelessResult.pdf_base64, "application/pdf")}>Download PDF</button>
                   <button className="small-button" type="button" onClick={() => downloadTextFile(`${statelessResult.output_basename}.typ`, statelessResult.typst_source)}>Download Typst</button>

@@ -347,24 +347,19 @@ ${JSON.stringify(draft)}`;
 }
 
 async function callGemini(prompt: string, apiKey: string, maxTokens: number) {
-  const response = await fetch("https://generativelanguage.googleapis.com/v1beta/openai/chat/completions", {
+  const model = process.env.STATELESS_MODEL_NAME || "gemini-2.5-flash";
+  const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(apiKey)}`, {
     method: "POST",
-    headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
-      model: process.env.STATELESS_MODEL_NAME || "gemini-2.5-flash",
-      stream: false,
-      // OpenAI-compatible name for Gemini's maximum output-token setting.
-      max_tokens: maxTokens,
-      response_format: { type: "json_object" },
-      messages: [
-        { role: "system", content: "You are a precise resume tailoring engine. Return valid JSON only." },
-        { role: "user", content: prompt },
-      ],
+      systemInstruction: { parts: [{ text: "You are a precise resume tailoring engine. Return valid JSON only." }] },
+      contents: [{ role: "user", parts: [{ text: prompt }] }],
+      generationConfig: { responseMimeType: "application/json", maxOutputTokens: maxTokens },
     }),
   });
   if (!response.ok) throw new Error(`Gemini request failed: ${response.status} ${await response.text()}`);
   const payload = await response.json();
-  const content = payload?.choices?.[0]?.message?.content;
+  const content = payload?.candidates?.[0]?.content?.parts?.map((part: { text?: string }) => part.text || "").join("");
   if (!content) throw new Error("Gemini returned an empty response.");
   return JSON.parse(content);
 }
@@ -407,10 +402,11 @@ export default async function handler(req: any, res: any) {
     if (pdfBuffer.byteLength > MAX_OUTPUT_BYTES) return jsonResponse(res, 413, { detail: "Generated PDF is too large for Vercel response limits." });
 
     let scoreReport: ScoreReport | null = null;
+    let scoreError: string | null = null;
     try {
       scoreReport = await callGemini(scorePrompt(body, draft), apiKey, MAX_SCORE_OUTPUT_TOKENS) as ScoreReport;
     } catch {
-      scoreReport = null;
+      scoreError = "Gemini scoring was unavailable for this run.";
     }
 
     return jsonResponse(res, 200, {
@@ -419,6 +415,8 @@ export default async function handler(req: any, res: any) {
       page_count: 1,
       draft,
       score_report: scoreReport,
+      score_error: scoreError,
+      fit_summary: draft.fit_summary || null,
       compile_logs: [],
       output_basename: safePart(body.output_basename || "tailored-resume"),
       model_name: process.env.STATELESS_MODEL_NAME || "gemini-2.5-flash",
