@@ -1,3 +1,5 @@
+name: cv-docker-prod
+
 x-runtime-defaults: &runtime_defaults
   restart: unless-stopped
 
@@ -10,38 +12,55 @@ x-dns-defaults: &dns_defaults
     - attempts:3
 
 services:
+  caddy:
+    <<: *runtime_defaults
+    image: caddy:2.8-alpine
+    environment:
+      STATEFUL_DOMAIN: ${STATEFUL_DOMAIN:-localhost:80}
+      STATEFUL_BASIC_AUTH_USER: ${STATEFUL_BASIC_AUTH_USER:-admin}
+      STATEFUL_BASIC_AUTH_HASH: ${STATEFUL_BASIC_AUTH_HASH:-replace_with_caddy_hash}
+    ports:
+      - "${HTTP_PORT:-80}:80"
+      - "${HTTPS_PORT:-443}:443"
+    volumes:
+      - ./caddy/Caddyfile.stateful:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      frontend:
+        condition: service_started
+
   frontend:
     <<: *runtime_defaults
-    image: cv-docker-frontend-stateful
+    image: cv-docker-frontend-stateful-prod
     build:
       context: ./frontend
       args:
-        VITE_API_BASE_URL: ${VITE_API_BASE_URL:-}
+        VITE_API_BASE_URL: ""
         VITE_DEMO_VIDEO_URL: ${VITE_DEMO_VIDEO_URL:-}
-    ports:
-      - "${FRONTEND_PORT:-3000}:80"
+    expose:
+      - "80"
     depends_on:
       api:
         condition: service_healthy
 
   api:
     <<: [*runtime_defaults, *dns_defaults]
-    image: cv-docker-api-stateful
+    image: cv-docker-api-stateful-prod
     build:
       context: ./api
       target: stateful
     environment:
-      APP_ENV: ${APP_ENV:-development}
-      REQUIRE_API_AUTH: ${REQUIRE_API_AUTH:-false}
-      API_AUTH_TOKEN: ${API_AUTH_TOKEN:-}
-      API_ALLOWED_ORIGINS: ${API_ALLOWED_ORIGINS:-http://localhost:3000}
-      API_ENABLE_DOCS: ${API_ENABLE_DOCS:-true}
-      API_PUBLIC_FILES_ENABLED: ${API_PUBLIC_FILES_ENABLED:-true}
+      APP_ENV: production
+      REQUIRE_API_AUTH: "false"
+      API_ENABLE_DOCS: "false"
+      API_PUBLIC_FILES_ENABLED: "true"
+      API_ALLOWED_ORIGINS: ""
       LLM_PROVIDER: ${LLM_PROVIDER:-auto}
-      PROFILE_DIR: ${PROFILE_DIR:-/app/data/profile}
-      OUTPUT_DIR: ${OUTPUT_DIR:-/app/outputs}
-      COMPILER_URL: ${COMPILER_URL:-http://typst-compiler:8001}
-      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-http://localhost:8000}
+      PROFILE_DIR: /app/data/profile
+      OUTPUT_DIR: /app/outputs
+      COMPILER_URL: http://typst-compiler:8001
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-https://${STATEFUL_DOMAIN}}
       MAX_COMPILE_RETRIES: ${MAX_COMPILE_RETRIES:-4}
       MAX_GENERATOR_RETRIES: ${MAX_GENERATOR_RETRIES:-2}
       MAX_SCORER_RETRIES: ${MAX_SCORER_RETRIES:-2}
@@ -50,18 +69,15 @@ services:
       ABACUS_BASE_URL: ${ABACUS_BASE_URL:-https://routellm.abacus.ai/v1}
       MODEL_NAME: ${MODEL_NAME:-gpt-5-mini}
       OPENAI_REASONING_EFFORT: ${OPENAI_REASONING_EFFORT:-low}
-      ENABLE_DEMO_MODE: ${ENABLE_DEMO_MODE:-true}
-      OUTPUT_BASENAME: ${OUTPUT_BASENAME:-tailored-resume}
+      ENABLE_DEMO_MODE: ${ENABLE_DEMO_MODE:-false}
       CODEX_HOME: /app/.codex
       CODEX_MODEL: ${CODEX_MODEL:-gpt-5.6-terra}
       CODEX_REASONING_EFFORT: ${CODEX_REASONING_EFFORT:-low}
       CODEX_TIMEOUT_SECONDS: ${CODEX_TIMEOUT_SECONDS:-240}
       AUTO_PROVIDER_ORDER: ${AUTO_PROVIDER_ORDER:-codex,abacus}
-    ports:
-      - "${API_PORT:-8000}:8000"
     volumes:
-      - ./data:/app/data
-      - ./outputs:/app/outputs
+      - ${STATEFUL_DATA_DIR:-./data.prod}:/app/data
+      - ${STATEFUL_OUTPUT_DIR:-./outputs.prod}:/app/outputs
       - codex_auth:/app/.codex
     healthcheck:
       test:
@@ -83,10 +99,11 @@ services:
     <<: *runtime_defaults
     build:
       context: ./compiler
-    ports:
-      - "${COMPILER_PORT:-8001}:8001"
     environment:
       TMP_DIR: /tmp/typst
+    tmpfs:
+      - /tmp:size=256m,mode=1777
+    read_only: true
     healthcheck:
       test:
         [
@@ -108,8 +125,7 @@ services:
     environment:
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
       TELEGRAM_ALLOWED_USER_IDS: ${TELEGRAM_ALLOWED_USER_IDS:-}
-      API_URL: ${API_URL:-http://api:8000}
-      API_AUTH_TOKEN: ${API_AUTH_TOKEN:-}
+      API_URL: http://api:8000
       OUTPUT_BASENAME: ${OUTPUT_BASENAME:-tailored-resume}
     depends_on:
       api:
@@ -122,4 +138,6 @@ networks:
       com.docker.network.driver.mtu: 1400
 
 volumes:
+  caddy_data:
+  caddy_config:
   codex_auth:

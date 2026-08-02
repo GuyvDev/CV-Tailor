@@ -7,12 +7,13 @@ import tempfile
 from pathlib import Path
 
 from fastapi import FastAPI
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from pypdf import PdfReader
 
 
 class CompileRequest(BaseModel):
     typst_source: str
+    assets_base64: dict[str, str] = Field(default_factory=dict)
 
 
 class CompileResponse(BaseModel):
@@ -39,6 +40,17 @@ async def compile_typst(payload: CompileRequest) -> CompileResponse:
         source_path = Path(tmp_dir) / "resume.typ"
         pdf_path = Path(tmp_dir) / "resume.pdf"
         source_path.write_text(payload.typst_source, encoding="utf-8")
+        for filename, encoded in payload.assets_base64.items():
+            safe_name = Path(filename).name
+            if safe_name != filename or Path(safe_name).suffix.lower() not in {".png", ".jpg", ".jpeg"}:
+                return CompileResponse(success=False, compile_log=f"Invalid asset filename: {filename}")
+            try:
+                content = base64.b64decode(encoded, validate=True)
+            except ValueError:
+                return CompileResponse(success=False, compile_log=f"Invalid base64 asset: {filename}")
+            if len(content) > 5 * 1024 * 1024:
+                return CompileResponse(success=False, compile_log=f"Asset is too large: {filename}")
+            (Path(tmp_dir) / safe_name).write_bytes(content)
 
         command = [
             "typst",

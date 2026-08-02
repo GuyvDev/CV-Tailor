@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import difflib
 import json
 import logging
 import os
 import re
 import secrets
+from datetime import UTC, datetime
+from io import BytesIO
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -34,6 +37,21 @@ ALLOWED_USER_IDS: set[int] = set(
     if x.strip()
 )
 API_URL = os.environ.get("API_URL", "http://api:8000")
+API_AUTH_TOKEN = os.environ.get("API_AUTH_TOKEN", "").strip()
+
+if not BOT_TOKEN.strip():
+    raise RuntimeError("TELEGRAM_BOT_TOKEN is required when the Telegram profile is enabled.")
+if not ALLOWED_USER_IDS:
+    raise RuntimeError(
+        "TELEGRAM_ALLOWED_USER_IDS is required; refusing to start an unrestricted bot."
+    )
+
+
+def api_headers() -> dict[str, str]:
+    if not API_AUTH_TOKEN:
+        return {}
+    return {"Authorization": f"Bearer {API_AUTH_TOKEN}"}
+
 
 SCRAPE_HEADERS = {
     "User-Agent": (
@@ -76,6 +94,7 @@ COMEET_HOSTS = {"comeet.com", "www.comeet.com", "comeet.co", "www.comeet.co"}
 STAGE_LABELS: dict[str, str] = {
     "queued": "Queued...",
     "loading_profile": "Loading profile...",
+    "provider_fallback": "Selected provider has no remaining quota; restarting with fallback...",
     "gen_attempt_1": "Generating CV (gen 1/2)...",
     "gen_attempt_2": "Revising CV (gen 2/2)...",
     "compile_attempt_1": "Compiling PDF (attempt 1/2)...",
@@ -102,8 +121,6 @@ def stage_label(stage: str | None) -> str:
 # ── helpers ──────────────────────────────────────────────────────────────────
 
 def is_allowed(update: Update) -> bool:
-    if not ALLOWED_USER_IDS:
-        return True
     return update.effective_user.id in ALLOWED_USER_IDS
 
 
@@ -459,6 +476,7 @@ async def submit_job(
     source_job_id: str = "",
     edit_instructions: str | None = None,
     approved_draft: dict | None = None,
+    provider: str = "auto",
 ) -> str:
     logger.info(f"Submitting job to API with role_focus={role_focus}, label={label!r}")
     payload: dict = {
@@ -468,13 +486,14 @@ async def submit_job(
         "label": label,
         "source_url": source_url,
         "source_job_id": source_job_id,
+        "provider": provider,
     }
     if edit_instructions:
         payload["edit_instructions"] = edit_instructions
     if approved_draft is not None:
         payload["approved_draft"] = approved_draft
     try:
-        async with httpx.AsyncClient(timeout=30) as client:
+        async with httpx.AsyncClient(timeout=30, headers=api_headers()) as client:
             resp = await client.post(f"{API_URL}/api/generate", json=payload)
             resp.raise_for_status()
             job_id = resp.json()["job_id"]
@@ -486,7 +505,7 @@ async def submit_job(
 
 async def submit_edit_preview(source_job_id: str, edit_instructions: str) -> dict:
     try:
-        async with httpx.AsyncClient(timeout=120) as client:
+        async with httpx.AsyncClient(timeout=120, headers=api_headers()) as client:
             resp = await client.post(
                 f"{API_URL}/api/edit-preview",
                 json={
@@ -505,7 +524,7 @@ async def request_score_resume(source_job_id: str, job_description: str | None =
     if job_description is not None:
         payload["job_description"] = job_description
     try:
-        async with httpx.AsyncClient(timeout=120) as client:
+        async with httpx.AsyncClient(timeout=120, headers=api_headers()) as client:
             resp = await client.post(f"{API_URL}/api/score-existing", json=payload)
             resp.raise_for_status()
             return resp.json()
@@ -513,7 +532,48 @@ async def request_score_resume(source_job_id: str, job_description: str | None =
         raise RuntimeError(_format_network_error("api", exc)) from exc
 
 
-async def _safe_edit(msg: Message, text: str, parse_mode: str = "Markdown", reply_markup=None) -> None:
+async def request_cover_letter(source_job_id: str, instructions: str = "") -> dict:
+    try:
+        async with httpx.AsyncClient(timeout=150, headers=api_headers()) as client:
+            resp = await client.post(
+                f"{API_URL}/api/cover-letter",
+                json={"source_job_id": source_job_id, "instructions": instructions},
+            )
+            resp.raise_for_status()
+            return resp.json()
+    except httpx.HTTPError as exc:
+        raise RuntimeError(_format_network_error("api", exc)) from exc
+
+
+async def request_edit_cover_letter(source_job_id: str, instructions: str) -> dict:
+    try:
+        async with httpx.AsyncClient(timeout=150, headers=api_headers()) as client:
+            resp = await client.post(
+                f"{API_URL}/api/cover-letter/edit",
+                json={"source_job_id": source_job_id, "instructions": instructions},
+            )
+            resp.raise_for_status()
+            return resp.json()
+    except httpx.HTTPError as exc:
+        raise RuntimeError(_format_network_error("api", exc)) from exc
+
+
+async def request_provider_usage() -> dict:
+    try:
+        async with httpx.AsyncClient(timeout=45, headers=api_headers()) as client:
+            resp = await client.get(f"{API_URL}/api/provider-usage")
+            resp.raise_for_status()
+            return resp.json()
+    except httpx.HTTPError as exc:
+        raise RuntimeError(_format_network_error("api", exc)) from exc
+
+
+async def _safe_edit(
+    msg: Message,
+    text: str,
+    parse_mode: str | None = "Markdown",
+    reply_markup=None,
+) -> None:
     try:
         await msg.edit_text(text, parse_mode=parse_mode, reply_markup=reply_markup)
     except Exception as e:
@@ -525,7 +585,7 @@ async def poll_job(job_id: str, status_msg: Message | None, domain: str, max_sec
     logger.info(f"Polling job {job_id}...")
     last_stage = None
     try:
-        async with httpx.AsyncClient(timeout=15) as client:
+        async with httpx.AsyncClient(timeout=15, headers=api_headers()) as client:
             for _ in range(max_seconds // 5):
                 await asyncio.sleep(5)
                 resp = await client.get(f"{API_URL}/api/jobs/{job_id}")
@@ -561,7 +621,7 @@ async def poll_job(job_id: str, status_msg: Message | None, domain: str, max_sec
 
 async def download_artifact(url: str) -> bytes:
     try:
-        async with httpx.AsyncClient(timeout=60) as client:
+        async with httpx.AsyncClient(timeout=60, headers=api_headers()) as client:
             resp = await client.get(f"{API_URL}{url}")
             resp.raise_for_status()
             return resp.content
@@ -580,7 +640,7 @@ async def download_typst(typst_url: str) -> bytes:
 async def fetch_cv_list() -> list[dict]:
     """Return all jobs from the API sorted newest first."""
     try:
-        async with httpx.AsyncClient(timeout=15) as client:
+        async with httpx.AsyncClient(timeout=15, headers=api_headers()) as client:
             resp = await client.get(f"{API_URL}/api/jobs")
             resp.raise_for_status()
             return resp.json()
@@ -589,7 +649,12 @@ async def fetch_cv_list() -> list[dict]:
 
 
 def filter_jobs_for_action(jobs: list[dict], action: str) -> list[dict]:
-    if action == "edit":
+    if action == "editcoverletter":
+        return [
+            job for job in jobs
+            if job.get("status") in EDITABLE_JOB_STATUSES and job.get("cover_letter_exists")
+        ]
+    if action in {"edit", "coverletter"}:
         return [job for job in jobs if job.get("status") in EDITABLE_JOB_STATUSES]
     if action == "remove":
         return [job for job in jobs if job.get("status") in REMOVABLE_JOB_STATUSES]
@@ -638,7 +703,11 @@ def _normalize_lookup(value: str) -> str:
 def _picker_text(action: str, jobs: list[dict]) -> str:
     if not jobs:
         return f"No CVs available to {action}."
-    lines = [f"Select a CV to {action}:"]
+    action_label = {
+        "coverletter": "create a cover letter for",
+        "editcoverletter": "edit the cover letter for",
+    }.get(action, action)
+    lines = [f"Select a CV to {action_label}:"]
     for job in jobs[:12]:
         lines.append(_job_summary_line(job))
     if len(jobs) > 12:
@@ -760,7 +829,7 @@ def build_confirm_keyboard(session_id: str, mode: str) -> InlineKeyboardMarkup:
 
 async def fetch_job(job_id: str) -> dict | None:
     try:
-        async with httpx.AsyncClient(timeout=15) as client:
+        async with httpx.AsyncClient(timeout=15, headers=api_headers()) as client:
             resp = await client.get(f"{API_URL}/api/jobs/{job_id}")
             if resp.status_code == 200:
                 return resp.json()
@@ -771,7 +840,7 @@ async def fetch_job(job_id: str) -> dict | None:
 
 async def request_stop_job(job_id: str) -> tuple[dict | None, str | None]:
     try:
-        async with httpx.AsyncClient(timeout=15) as client:
+        async with httpx.AsyncClient(timeout=15, headers=api_headers()) as client:
             resp = await client.post(f"{API_URL}/api/jobs/{job_id}/stop")
             if resp.status_code == 200:
                 return resp.json(), None
@@ -784,7 +853,7 @@ async def request_stop_job(job_id: str) -> tuple[dict | None, str | None]:
 
 async def request_delete_job(job_id: str) -> tuple[bool, str | None]:
     try:
-        async with httpx.AsyncClient(timeout=15) as client:
+        async with httpx.AsyncClient(timeout=15, headers=api_headers()) as client:
             resp = await client.delete(f"{API_URL}/api/jobs/{job_id}")
             if resp.status_code == 204:
                 return True, None
@@ -838,7 +907,9 @@ async def resolve_original(
 
 
 def _empty_picker_message(action: str) -> str:
-    if action == "edit":
+    if action == "editcoverletter":
+        return "No generated cover letters found. Run /coverletter first."
+    if action in {"edit", "coverletter"}:
         return "No completed CVs found."
     if action == "remove":
         return "No saved CVs found to remove."
@@ -856,8 +927,13 @@ async def send_cv_picker(
     if not jobs:
         await message.reply_text(_empty_picker_message(action))
         return
-    if action == "edit":
-        keyboard = build_cv_keyboard("edit_select", jobs)
+    if action in {"edit", "coverletter", "editcoverletter"}:
+        callback_action = {
+            "edit": "edit_select",
+            "coverletter": "coverletter_select",
+            "editcoverletter": "editcoverletter_select",
+        }[action]
+        keyboard = build_cv_keyboard(callback_action, jobs)
         await message.reply_text(_picker_text(action, jobs), reply_markup=keyboard)
         return
     session_id, session = _create_picker_session(context, action, jobs)
@@ -1095,6 +1171,7 @@ async def run_approved_edit(
             source_job_id=source_job_id,
             edit_instructions=instructions,
             approved_draft=approved_draft,
+            provider=str(original.get("extra", {}).get("actual_provider") or "auto"),
         )
     except Exception as e:
         await _safe_edit(status_msg, f"*{label}*\nError submitting approved edit: `{e}`")
@@ -1210,7 +1287,7 @@ async def run_edit(
 
 
 async def process_one(
-    url: str, role_focus: str | None, status_msg: Message | None
+    url: str, role_focus: str | None, status_msg: Message | None, provider: str
 ) -> tuple[str, dict, bytes | None, bytes | None]:
     domain = urlparse(url).netloc or url
     label = domain.split(".")[0].lower()
@@ -1229,7 +1306,9 @@ async def process_one(
     logger.info(f"Scraped {len(description)} characters from {url}")
     if status_msg is not None:
         await _safe_edit(status_msg, f"*{domain}*\nSubmitting job...")
-    job_id = await submit_job(description, role_focus, label=label, source_url=url)
+    job_id = await submit_job(
+        description, role_focus, label=label, source_url=url, provider=provider
+    )
     metadata = await poll_job(job_id, status_msg, domain)
     pdf_bytes: bytes | None = None
     typ_bytes: bytes | None = None
@@ -1247,6 +1326,7 @@ async def process_uploaded_text(
     role_focus: str | None,
     extra_text: str,
     status_msg: Message | None,
+    provider: str,
 ) -> tuple[str, dict, bytes | None, bytes | None]:
     filename, description = await read_uploaded_text(message)
     label = sanitize_label(filename)
@@ -1259,7 +1339,7 @@ async def process_uploaded_text(
         )
     if status_msg is not None:
         await _safe_edit(status_msg, f"*{display}*\nSubmitting uploaded text...")
-    job_id = await submit_job(description, role_focus, label=label)
+    job_id = await submit_job(description, role_focus, label=label, provider=provider)
     metadata = await poll_job(job_id, status_msg, display)
     pdf_bytes: bytes | None = None
     typ_bytes: bytes | None = None
@@ -1274,11 +1354,12 @@ async def process_direct_text(
     text: str,
     role_focus: str | None,
     status_msg: Message | None,
+    provider: str,
 ) -> tuple[str, dict, bytes | None, bytes | None]:
     label = "telegram-text"
     if status_msg is not None:
         await _safe_edit(status_msg, f"*{label}*\nSubmitting tagged text...")
-    job_id = await submit_job(text, role_focus, label=label)
+    job_id = await submit_job(text, role_focus, label=label, provider=provider)
     metadata = await poll_job(job_id, status_msg, label)
     pdf_bytes: bytes | None = None
     typ_bytes: bytes | None = None
@@ -1291,12 +1372,115 @@ async def process_direct_text(
 
 # ── handlers ─────────────────────────────────────────────────────────────────
 
+def selected_provider(context: ContextTypes.DEFAULT_TYPE) -> str:
+    value = str(context.user_data.get("generation_provider") or "auto").lower()
+    return value if value in {"auto", "codex", "abacus"} else "auto"
+
+
+def provider_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [[
+            InlineKeyboardButton("Auto", callback_data="provider_set:auto"),
+            InlineKeyboardButton("Codex", callback_data="provider_set:codex"),
+            InlineKeyboardButton("Abacus", callback_data="provider_set:abacus"),
+        ]]
+    )
+
+
+async def cmd_provider(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_allowed(update):
+        return
+    requested = (context.args or [""])[0].strip().lower()
+    if requested in {"auto", "codex", "abacus"}:
+        context.user_data["generation_provider"] = requested
+        await update.message.reply_text(
+            f"Generation provider set to *{requested}*. Generator and reviewer will use the same provider.",
+            parse_mode="Markdown",
+        )
+        return
+    current = selected_provider(context)
+    await update.message.reply_text(
+        f"Current generation provider: *{current}*\nChoose a provider for new jobs:",
+        parse_mode="Markdown",
+        reply_markup=provider_keyboard(),
+    )
+
+
+def _format_reset(timestamp: object) -> str:
+    try:
+        return datetime.fromtimestamp(int(timestamp), tz=UTC).strftime("%Y-%m-%d %H:%M UTC")
+    except (TypeError, ValueError, OSError):
+        return "unknown"
+
+
+def _provider_usage_text(payload: dict, selected: str) -> str:
+    lines = [f"Provider selection: {selected}", ""]
+    codex = payload.get("codex") if isinstance(payload.get("codex"), dict) else {}
+    account = codex.get("account") if isinstance(codex.get("account"), dict) else {}
+    plan = account.get("planType") or "unknown plan"
+    if not codex.get("authenticated"):
+        lines.append("Codex: not authenticated inside the API container")
+        if codex.get("error"):
+            lines.append(f"  {str(codex['error'])[:240]}")
+    else:
+        lines.append(f"Codex: {plan} — {'available' if codex.get('available') else 'limit reached'}")
+        rate_result = codex.get("rate_limits") if isinstance(codex.get("rate_limits"), dict) else {}
+        buckets = rate_result.get("rateLimitsByLimitId")
+        if not isinstance(buckets, dict):
+            single = rate_result.get("rateLimits")
+            buckets = {"codex": single} if isinstance(single, dict) else {}
+        for bucket_id, bucket in buckets.items():
+            if not isinstance(bucket, dict):
+                continue
+            label = bucket.get("limitName") or bucket_id
+            windows: list[str] = []
+            for window_name in ("primary", "secondary"):
+                window = bucket.get(window_name)
+                if not isinstance(window, dict):
+                    continue
+                used = float(window.get("usedPercent") or 0)
+                windows.append(
+                    f"{window_name} {used:.0f}% used, resets {_format_reset(window.get('resetsAt'))}"
+                )
+            if windows:
+                lines.append(f"  {label}: " + "; ".join(windows))
+
+    abacus = payload.get("abacus") if isinstance(payload.get("abacus"), dict) else {}
+    usage = abacus.get("usage") if isinstance(abacus.get("usage"), dict) else {}
+    if not abacus.get("configured"):
+        lines.extend(["", "Abacus: API key not configured"])
+    else:
+        status = "available" if abacus.get("available") else "temporarily quota-blocked"
+        lines.extend([
+            "",
+            f"Abacus: {status}",
+            f"  locally observed: {int(usage.get('requests') or 0)} requests, "
+            f"{int(usage.get('total_tokens') or 0):,} tokens",
+            "  remaining balance: not exposed by the documented RouteLLM API",
+        ])
+        if usage.get("last_quota_error"):
+            lines.append(f"  last quota error: {str(usage['last_quota_error'])[:240]}")
+    return "\n".join(lines)
+
+
+async def cmd_usage(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_allowed(update):
+        return
+    status = await update.message.reply_text("Reading provider limits...")
+    try:
+        payload = await request_provider_usage()
+        await status.edit_text(_provider_usage_text(payload, selected_provider(context)))
+    except Exception as exc:
+        await status.edit_text(f"Could not read provider usage: {exc}")
+
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_allowed(update):
         return
     await update.message.reply_text(
         "*CV Docker Bot*\n\n"
         "*Generate:* Send one or more job posting URLs (one per line).\n"
+        "`/provider` — choose Auto, Codex, or Abacus for new jobs\n"
+        "`/usage` — show Codex limits and observed Abacus usage\n"
         "Optional role prefix: `ai:`, `systems:`, `software:`, `architecture:`\n\n"
         "*Generate from tagged text message:* Start the message with `#cv`\n"
         "Optional first line or second line role hint: `#cv systems` or `role: systems`\n\n"
@@ -1309,6 +1493,12 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "`/score <id>` — score against the original job description\n"
         "`/score <id> <url>` — score against a freshly scraped job description from that URL\n"
         "Reply to a new job description text or `.txt` / `.md` file with `/score <id>` — score against the new description\n\n"
+        "*Create a cover letter for a completed job:*\n"
+        "`/coverletter` — pick the specific job from a list\n"
+        "`/coverletter <id-or-label> [instructions]` — generate directly\n\n"
+        "*Edit a generated cover letter:*\n"
+        "`/editcoverletter` — pick a cover letter, then send instructions\n"
+        "`/editcoverletter <id-or-label> <instructions>` — edit directly\n\n"
         "*Stop active jobs:*\n"
         "`/stop` — multi-select from active jobs\n"
         "`/stop <id>` — direct\n\n"
@@ -1316,6 +1506,97 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "`/remove` — multi-select from saved CVs\n"
         "`/remove <id>` — direct",
         parse_mode="Markdown",
+    )
+
+
+async def send_cover_letter(
+    message: Message,
+    original: dict,
+    instructions: str = "",
+    *,
+    edit: bool = False,
+) -> None:
+    full_id = original["job_id"]
+    label = original.get("extra", {}).get("label") or full_id[:8]
+    status_msg = await message.reply_text(
+        f"{'Editing' if edit else 'Creating'} a cover letter for {label} ({full_id[:8]})...",
+    )
+    try:
+        result = (
+            await request_edit_cover_letter(full_id, instructions)
+            if edit
+            else await request_cover_letter(full_id, instructions)
+        )
+        filename = result.get("filename") or f"cover-letter-{full_id[:8]}.pdf"
+        await status_msg.delete()
+        await message.reply_document(
+            document=BytesIO(base64.b64decode(result["pdf_base64"])),
+            filename=filename,
+            caption=(
+                f"{'Edited c' if edit else 'C'}over letter for {label} ({full_id[:8]}). "
+                "Verified: exactly one page and no body/signature overlap."
+            ),
+        )
+    except Exception as exc:
+        await _safe_edit(status_msg, f"Cover-letter generation failed: {exc}", parse_mode=None)
+
+
+async def cmd_coverletter(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_allowed(update):
+        return
+    args = context.args or []
+    if not args:
+        try:
+            await send_cv_picker(update.message, context, "coverletter")
+        except Exception as exc:
+            await update.message.reply_text(
+                f"Could not fetch completed jobs: `{exc}`", parse_mode="Markdown"
+            )
+        return
+
+    lookup = args[0]
+    instructions = " ".join(args[1:]).strip()
+    try:
+        original, error = await resolve_original(
+            lookup, allowed_statuses=EDITABLE_JOB_STATUSES
+        )
+    except Exception as exc:
+        await update.message.reply_text(f"Job lookup failed: `{exc}`", parse_mode="Markdown")
+        return
+    if original is None:
+        await update.message.reply_text(error or "No completed job matched that ID or label.")
+        return
+    await send_cover_letter(update.message, original, instructions)
+
+
+async def cmd_editcoverletter(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_allowed(update):
+        return
+    args = context.args or []
+    if not args:
+        try:
+            await send_cv_picker(update.message, context, "editcoverletter")
+        except Exception as exc:
+            await update.message.reply_text(
+                f"Could not fetch generated cover letters: `{exc}`", parse_mode="Markdown"
+            )
+        return
+    if len(args) < 2:
+        await update.message.reply_text(
+            "Usage: `/editcoverletter <id-or-label> <instructions>`\n"
+            "Or use `/editcoverletter` to pick one first.",
+            parse_mode="Markdown",
+        )
+        return
+    original, error = await resolve_original(args[0], allowed_statuses=EDITABLE_JOB_STATUSES)
+    if original is None:
+        await update.message.reply_text(error or "No completed job matched that ID or label.")
+        return
+    await send_cover_letter(
+        update.message,
+        original,
+        " ".join(args[1:]).strip(),
+        edit=True,
     )
 
 
@@ -1547,9 +1828,22 @@ async def cmd_remove(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_allowed(update):
+        return
     query = update.callback_query
     await query.answer()
     data = query.data or ""
+
+    if data.startswith("provider_set:"):
+        provider = data.split(":", 1)[1]
+        if provider not in {"auto", "codex", "abacus"}:
+            await query.edit_message_text("Unknown provider selection.")
+            return
+        context.user_data["generation_provider"] = provider
+        await query.edit_message_text(
+            f"Generation provider set to {provider}. Generator and reviewer will use the same provider."
+        )
+        return
 
     if data == "cancel":
         await query.edit_message_text("Cancelled.")
@@ -1772,6 +2066,34 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     # ── edit_select: store pending state, ask for instructions ────────────────
+    if data.startswith("editcoverletter_select:"):
+        full_id = data.split(":", 1)[1]
+        original = await fetch_job(full_id)
+        if original is None or original.get("status") != "completed":
+            await query.edit_message_text("That completed job is no longer available.")
+            return
+        context.user_data["pending_cover_letter_edit_job_id"] = full_id
+        context.user_data["pending_cover_letter_edit_original"] = original
+        await query.edit_message_text(
+            f"Selected `{full_id[:8]}`. Now send the cover-letter edit instructions.\n\n"
+            "Example: `Make the second paragraph shorter and emphasize Linux systems work.`",
+            parse_mode="Markdown",
+        )
+        return
+
+    if data.startswith("coverletter_select:"):
+        full_id = data.split(":", 1)[1]
+        original = await fetch_job(full_id)
+        if original is None or original.get("status") != "completed":
+            await query.edit_message_text("That completed job is no longer available.")
+            return
+        await query.edit_message_text(
+            f"Selected `{full_id[:8]}`. Creating the cover letter...",
+            parse_mode="Markdown",
+        )
+        await send_cover_letter(query.message, original)
+        return
+
     if data.startswith("edit_select:"):
         full_id = data.split(":", 1)[1]
         context.user_data["pending_edit_job_id"] = full_id
@@ -1797,6 +2119,22 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     text = update.message.text or ""
+    provider = selected_provider(context)
+
+    if context.user_data.get("pending_cover_letter_edit_job_id"):
+        full_id = context.user_data.pop("pending_cover_letter_edit_job_id")
+        original = context.user_data.pop("pending_cover_letter_edit_original", None)
+        if original is None:
+            original = await fetch_job(full_id)
+        if original is None:
+            await update.message.reply_text(f"Job `{full_id[:8]}` not found.", parse_mode="Markdown")
+            return
+        instructions = text.strip()
+        if not instructions:
+            await update.message.reply_text("Please send non-empty edit instructions.")
+            return
+        await send_cover_letter(update.message, original, instructions, edit=True)
+        return
 
     # ── pending edit: treat message as instructions ───────────────────────────
     if context.user_data.get("pending_edit_job_id"):
@@ -1828,6 +2166,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 role_focus,
                 extra_text,
                 status_msg,
+                provider,
             )
         except Exception as exc:
             try:
@@ -1898,6 +2237,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 body,
                 role_focus,
                 status_msg,
+                provider,
             )
         except Exception as exc:
             try:
@@ -1964,7 +2304,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         status_msgs.append(msg)
 
     tasks = [
-        process_one(url, role, smsg)
+        process_one(url, role, smsg, provider)
         for (url, role), smsg in zip(jobs, status_msgs)
     ]
     results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -2020,7 +2360,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 def main() -> None:
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("provider", cmd_provider))
+    app.add_handler(CommandHandler("usage", cmd_usage))
     app.add_handler(CommandHandler("score", cmd_score))
+    app.add_handler(CommandHandler("coverletter", cmd_coverletter))
+    app.add_handler(CommandHandler("editcoverletter", cmd_editcoverletter))
     app.add_handler(CommandHandler("edit", cmd_edit))
     app.add_handler(CommandHandler("stop", cmd_stop))
     app.add_handler(CommandHandler("remove", cmd_remove))

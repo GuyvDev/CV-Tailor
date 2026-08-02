@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hmac
 import json
 import os
 import re
 import shutil
+from datetime import UTC, datetime, timedelta
 
 import httpx
 from openai import OpenAI
@@ -13,22 +15,40 @@ from dataclasses import dataclass, field
 from uuid import uuid4
 from pathlib import Path
 
-from fastapi import BackgroundTasks, FastAPI, HTTPException, status
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+from starlette.responses import JSONResponse
 
 from app.config import get_settings
-from app.data_loader import load_profile_data
+from app.cover_letter_renderer import (
+    compact_cover_letter,
+    cover_letter_company_edit,
+    infer_cover_letter_company,
+    is_header_only_cover_letter_edit,
+    render_cover_letter,
+)
+from app.data_loader import (
+    PersonalizationSettings,
+    ProfileData,
+    extract_contact_fields,
+    load_profile_data,
+)
 from app.models import (
     AiProfileDraftRequest,
     AiProfileDraftResponse,
     AppSettingsResponse,
+    CoverLetterEditRequest,
+    CoverLetterRequest,
+    CoverLetterResponse,
     CreateProfileRequest,
     EditPreviewRequest,
     EditPreviewResponse,
     GenerateRequest,
     GenerateResponse,
     JobMetadata,
+    OutputCleanupRequest,
+    OutputCleanupResponse,
     PersonalizationOptions,
     ProfileBundle,
     ProfileSummary,
@@ -38,6 +58,8 @@ from app.models import (
     ScoreResumeRequest,
     SwitchProfileRequest,
     ScoreResumeResponse,
+    StatelessGenerateRequest,
+    StatelessGenerateResponse,
 )
 from app.review_schema import ResumeScoreReport
 from app.renderer import render_resume
@@ -45,12 +67,54 @@ from app.resume_schema import ResumeDraft
 from app.services.compiler_client import CompilerClient
 from app.services.job_store import JobStore
 from app.services.openai_service import ResumeGenerator
+from app.services.provider_runtime import (
+    CodexRunner,
+    ProviderQuotaError,
+    ProviderUsageStore,
+)
 
 
 settings = get_settings()
 job_store = JobStore(settings.output_dir)
 compiler_client = CompilerClient(settings.compiler_url)
+provider_usage_store = ProviderUsageStore(settings.profile_dir.parent / "provider_usage.json")
+codex_runner = CodexRunner(
+    model=settings.codex_model_name,
+    reasoning_effort=settings.codex_reasoning_effort,
+    timeout_seconds=settings.codex_timeout_seconds,
+    work_dir=settings.codex_work_dir,
+)
 TERMINAL_STATUSES = {"completed", "failed", "stopped"}
+
+
+def _stateless_only() -> bool:
+    return os.getenv("STATELESS_ONLY", "false").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _docs_enabled() -> bool:
+    return settings.enable_docs
+
+
+def _public_files_enabled() -> bool:
+    return settings.public_files_enabled
+
+
+AUTH_EXEMPT_PREFIXES = ("/api/health",)
+
+
+def _stateless_allowed_prefixes() -> tuple[str, ...]:
+    prefixes = ["/api/stateless", "/api/health"]
+    if _docs_enabled():
+        prefixes.extend(["/docs", "/redoc", "/openapi.json"])
+    return tuple(prefixes)
+
+
+def _public_allowed_prefixes() -> tuple[str, ...]:
+    prefixes = ["/api/health"]
+    if _docs_enabled():
+        prefixes.extend(["/docs", "/redoc", "/openapi.json"])
+    return tuple(prefixes)
+
 
 PROFILE_FILES = {
     "master_profile": "master_profile.md",
@@ -179,7 +243,7 @@ def _read_app_settings_secret() -> dict[str, object]:
 def _app_settings_response() -> AppSettingsResponse:
     data = _read_app_settings_secret()
     return AppSettingsResponse(
-        llm_provider=str(data.get("llm_provider") or "openai"),
+        llm_provider=str(data.get("llm_provider") or "auto"),
         model_name=str(data.get("model_name") or "gpt-5-mini"),
         reasoning_effort=str(data.get("reasoning_effort") or "low"),
         abacus_base_url=str(data.get("abacus_base_url") or "https://routellm.abacus.ai/v1"),
@@ -187,6 +251,8 @@ def _app_settings_response() -> AppSettingsResponse:
         enable_demo_mode=bool(data.get("enable_demo_mode", True)),
         openai_api_key_configured=bool(str(data.get("openai_api_key") or "").strip()),
         abacus_api_key_configured=bool(str(data.get("abacus_api_key") or "").strip()),
+        codex_installed=codex_runner.installed(),
+        codex_authenticated=codex_runner.auth_file_exists(),
     )
 
 
@@ -194,7 +260,7 @@ def _write_app_settings(payload: SaveAppSettingsRequest) -> AppSettingsResponse:
     _profile_dir().mkdir(parents=True, exist_ok=True)
     current = _read_app_settings_secret()
     next_data = {
-        "llm_provider": payload.llm_provider.strip().lower() or "openai",
+        "llm_provider": payload.llm_provider.strip().lower() or "auto",
         "model_name": payload.model_name.strip() or "gpt-5-mini",
         "reasoning_effort": payload.reasoning_effort.strip() or "low",
         "abacus_base_url": payload.abacus_base_url.strip().rstrip("/") or "https://routellm.abacus.ai/v1",
@@ -207,21 +273,219 @@ def _write_app_settings(payload: SaveAppSettingsRequest) -> AppSettingsResponse:
     return _app_settings_response()
 
 
-def _resume_generator() -> ResumeGenerator:
+def _resume_generator(provider_override: str | None = None) -> ResumeGenerator:
     data = _read_app_settings_secret()
+    provider = provider_override or str(data.get("llm_provider") or "auto").strip().lower()
+    if provider == "auto":
+        provider = (
+            "codex"
+            if codex_runner.installed() and codex_runner.auth_file_exists()
+            else "abacus"
+            if str(data.get("abacus_api_key") or "").strip()
+            else "codex"
+        )
     return ResumeGenerator(
-        provider=str(data.get("llm_provider") or "openai").strip().lower(),
+        provider=provider,
         api_key=str(data.get("openai_api_key") or "") or None,
         abacus_api_key=str(data.get("abacus_api_key") or "") or None,
         abacus_base_url=str(data.get("abacus_base_url") or "https://routellm.abacus.ai/v1"),
         model_name=str(data.get("model_name") or "gpt-5-mini"),
         reasoning_effort=str(data.get("reasoning_effort") or "low"),
         enable_demo_mode=bool(data.get("enable_demo_mode", True)),
+        codex_runner=codex_runner,
+        usage_store=provider_usage_store,
     )
+
+
+def _provider_candidates(requested: str | None, source_job_id: str = "") -> list[str]:
+    if source_job_id:
+        try:
+            source = job_store.load(source_job_id)
+            pinned = str(source.extra.get("actual_provider") or "").strip().lower()
+            if pinned in {"codex", "abacus", "openai"}:
+                return [pinned]
+        except FileNotFoundError:
+            pass
+
+    data = _read_app_settings_secret()
+    selected = (requested or str(data.get("llm_provider") or "auto")).strip().lower()
+    if selected != "auto":
+        return [selected]
+
+    codex_status = codex_runner.account_status()
+    abacus_configured = bool(str(data.get("abacus_api_key") or "").strip())
+    availability = {
+        "codex": bool(codex_status.get("available")),
+        "abacus": abacus_configured and not provider_usage_store.abacus_quota_blocked(),
+    }
+    order = settings.auto_provider_order or ("codex", "abacus")
+    available = [provider for provider in order if availability.get(provider)]
+    # Keep configured fallbacks in the list: a stale preflight should not prevent
+    # a real attempt, and quota exceptions will advance to the next provider.
+    configured = {
+        "codex": codex_runner.installed() and codex_runner.auth_file_exists(),
+        "abacus": abacus_configured,
+    }
+    available.extend(
+        provider
+        for provider in order
+        if configured.get(provider) and provider not in available
+    )
+    return available
+
+
+def _generator_for_source(source_job_id: str) -> ResumeGenerator:
+    candidates = _provider_candidates(None, source_job_id)
+    if not candidates:
+        raise RuntimeError("Neither Codex nor Abacus is configured and available.")
+    return _resume_generator(candidates[0])
 
 
 def _output_basename() -> str:
     return _safe_part(str(_read_app_settings_secret().get("output_basename") or "tailored-resume"), max_len=80)
+
+
+def _default_stateless_template() -> str:
+    return '#set page(\n  paper: "us-letter",\n  margin: (x: 2.54cm, y: 2.00cm),\n)\n\n#set text(font: "DejaVu Sans", size: 10pt, fill: black)\n#set par(leading: 0.5em, justify: true, spacing: 0pt)\n#set block(spacing: 6pt)\n\n#let theme-blue = rgb("#00508C")\n\n#let section(title) = {\n  stack(\n    dir: ttb,\n    spacing: 1pt,\n    text(fill: theme-blue, weight: "bold", size: 11pt)[#upper(title)],\n    line(length: 100%, stroke: 0.5pt + theme-blue),\n  )\n  v(4pt)\n}\n\n#let project(title) = {\n  v(4pt)\n  text(fill: theme-blue, weight: "bold")[#title]\n}\n\n#let bullet(content) = {\n  grid(\n    columns: (12pt, 1fr),\n    gutter: 0pt,\n    align: (right, left),\n    [•#h(4pt)],\n    content\n  )\n}\n\n// Header\n{{CONTACT_HEADER}}\n\n#v(8pt)\n\n{{PROFILE_SECTION}}\n\n{{BODY_CONTENT}}\n'
+
+
+def _stateless_template(payload: StatelessGenerateRequest) -> str:
+    if payload.template_typst.strip():
+        return payload.template_typst
+    template_path = settings.profile_dir.parent / "profile.example" / "templates" / "base_resume.typ"
+    if not template_path.exists():
+        template_path = Path(__file__).parents[2] / "data" / "profile.example" / "templates" / "base_resume.typ"
+    if template_path.exists():
+        return template_path.read_text(encoding="utf-8")
+    return _default_stateless_template()
+
+
+def _stateless_profile(payload: StatelessGenerateRequest) -> ProfileData:
+    try:
+        projects = json.loads(payload.projects_json or "[]")
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=422, detail=f"projects_json is invalid JSON: {exc.msg}") from exc
+    try:
+        skills = json.loads(payload.skills_json or "{}")
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=422, detail=f"skills_json is invalid JSON: {exc.msg}") from exc
+    if not isinstance(projects, list):
+        raise HTTPException(status_code=422, detail="projects_json must be a JSON array.")
+    if not isinstance(skills, dict):
+        raise HTTPException(status_code=422, detail="skills_json must be a JSON object.")
+
+    return ProfileData(
+        master_profile=payload.candidate_profile,
+        projects=[project for project in projects if str(project.get("cv_status", "active")).lower() not in {"hold", "on_hold", "paused"}],
+        skills={str(key): [str(item) for item in value] for key, value in skills.items() if isinstance(value, list)},
+        rules=payload.rules,
+        cv_guidance=payload.research_guidelines,
+        template=_stateless_template(payload),
+        examples={},
+        style_references=[],
+        personalization=PersonalizationSettings.from_dict(payload.personalization.model_dump()),
+    )
+
+
+def _stateless_generator() -> ResumeGenerator:
+    flash_key = os.getenv("FLASH_API_KEY", "").strip()
+    provider = os.getenv("STATELESS_LLM_PROVIDER", "gemini").strip().lower()
+    model_name = os.getenv("STATELESS_MODEL_NAME", "gemini-2.5-flash").strip()
+    base_url = os.getenv("STATELESS_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai").rstrip("/")
+    enable_demo = os.getenv("STATELESS_ENABLE_DEMO_MODE", "false").strip().lower() in {"1", "true", "yes", "on"}
+    if provider == "gemini":
+        return ResumeGenerator(
+            provider="abacus",
+            api_key=None,
+            abacus_api_key=flash_key or None,
+            abacus_base_url=base_url,
+            model_name=model_name,
+            reasoning_effort=os.getenv("STATELESS_REASONING_EFFORT", "medium"),
+            enable_demo_mode=enable_demo,
+        )
+    return ResumeGenerator(
+        provider=provider,
+        api_key=os.getenv("OPENAI_API_KEY") or None,
+        abacus_api_key=os.getenv("ABACUS_API_KEY") or None,
+        abacus_base_url=os.getenv("ABACUS_BASE_URL", "https://routellm.abacus.ai/v1").rstrip("/"),
+        model_name=model_name,
+        reasoning_effort=os.getenv("STATELESS_REASONING_EFFORT", settings.reasoning_effort),
+        enable_demo_mode=enable_demo,
+    )
+
+
+def _run_stateless_generation(payload: StatelessGenerateRequest) -> StatelessGenerateResponse:
+    profile = _stateless_profile(payload)
+    generator = _stateless_generator()
+    request = GenerateRequest(
+        job_description=payload.job_description,
+        role_focus=payload.role_focus,
+        template="stateless",
+        label="stateless",
+    )
+    attempts = max(1, min(settings.max_generator_retries, 3))
+    scorer_attempts = max(1, min(settings.max_scorer_retries, attempts))
+    previous_draft: ResumeDraft | None = None
+    scorer_feedback: ResumeScoreReport | None = None
+    compile_feedback: str | None = None
+    compile_logs: list[str] = []
+    last_source = ""
+    last_pdf = ""
+    last_page_count = 0
+    last_draft: ResumeDraft | None = None
+
+    for attempt in range(1, attempts + 1):
+        draft = generator.generate_resume(
+            profile,
+            request,
+            attempt,
+            previous_draft,
+            scorer_feedback,
+            compile_feedback,
+        )
+        last_draft = draft
+        last_source = render_resume(profile.template, draft, profile.personalization)
+        compile_result = asyncio.run(compiler_client.compile(last_source))
+        compile_feedback = (
+            f"success={compile_result.success}, "
+            f"page_count={compile_result.page_count}, "
+            f"log={compile_result.compile_log.strip() or 'n/a'}"
+        )
+        compile_logs.append(f"gen {attempt}: {compile_feedback}")
+        last_page_count = compile_result.page_count or 0
+        last_pdf = compile_result.pdf_base64 or ""
+        if not compile_result.success or not last_pdf:
+            raise HTTPException(status_code=502, detail=f"Typst compilation failed: {compile_result.compile_log[:800]}")
+
+        if attempt <= scorer_attempts:
+            scorer_feedback = generator.score_resume(
+                profile,
+                request,
+                draft,
+                attempt,
+                attempt,
+                compile_feedback,
+            )
+            compile_logs.append(
+                f"scr {attempt}: quality={scorer_feedback.quality_score}, "
+                f"match={scorer_feedback.match_score}, decision={scorer_feedback.decision}"
+            )
+            if scorer_feedback.decision == "approve" and last_page_count == 1:
+                break
+        previous_draft = draft
+
+    if last_draft is None or not last_pdf:
+        raise HTTPException(status_code=500, detail="Stateless generation produced no output.")
+    return StatelessGenerateResponse(
+        pdf_base64=last_pdf,
+        typst_source=last_source,
+        page_count=last_page_count,
+        draft=last_draft,
+        score_report=scorer_feedback,
+        compile_logs=compile_logs,
+        output_basename=_safe_part(payload.output_basename or "tailored-resume", max_len=80),
+        model_name=generator.model_name,
+    )
 
 
 def _profile_draft_schema() -> dict:
@@ -353,10 +617,23 @@ def _validate_ai_profile_payload(payload: dict) -> None:
 
 def _draft_profile_with_ai(source_text: str) -> AiProfileDraftResponse:
     data = _read_app_settings_secret()
-    provider = str(data.get("llm_provider") or "openai").strip().lower()
+    provider = str(data.get("llm_provider") or "auto").strip().lower()
+    if provider == "auto":
+        candidates = _provider_candidates("auto")
+        if not candidates:
+            raise HTTPException(status_code=409, detail="Neither Codex nor Abacus is available.")
+        provider = candidates[0]
     model = str(data.get("model_name") or "gpt-5-mini")
     system_prompt, user_prompt = _build_ai_profile_prompt(source_text)
     schema = _profile_draft_schema()
+
+    if provider == "codex":
+        decoded = codex_runner.generate(
+            f"Role and constraints:\n{system_prompt}\n\nTask input:\n{user_prompt}",
+            schema["schema"],
+        )
+        _validate_ai_profile_payload(decoded)
+        return _profile_bundle_from_ai_payload(decoded)
 
     if provider == "abacus":
         api_key = str(data.get("abacus_api_key") or "")
@@ -465,15 +742,49 @@ class JobControl:
 
 job_controls: dict[str, JobControl] = {}
 
-app = FastAPI(title="cv-docker-api", version="0.1.0")
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+app = FastAPI(
+    title="cv-docker-api",
+    version="0.1.0",
+    docs_url="/docs" if _docs_enabled() else None,
+    redoc_url="/redoc" if _docs_enabled() else None,
+    openapi_url="/openapi.json" if _docs_enabled() else None,
 )
-app.mount("/files", StaticFiles(directory=settings.output_dir), name="files")
+if settings.allowed_origins:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=list(settings.allowed_origins),
+        allow_credentials=False,
+        allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
+        allow_headers=["Content-Type", "Authorization"],
+    )
+
+
+def _authorized(request: Request) -> bool:
+    token = settings.api_auth_token or ""
+    if not token:
+        return False
+    supplied = request.headers.get("authorization", "")
+    if supplied.lower().startswith("bearer "):
+        supplied = supplied[7:].strip()
+    else:
+        supplied = request.headers.get("x-api-token", "").strip()
+    return bool(supplied) and hmac.compare_digest(supplied, token)
+
+
+@app.middleware("http")
+async def production_guard(request: Request, call_next):
+    path = request.url.path
+    if _stateless_only() and path.startswith("/api/") and not path.startswith(_stateless_allowed_prefixes()):
+        return JSONResponse({"detail": "This deployment is running in stateless-only mode."}, status_code=404)
+    protected_path = path.startswith("/api/") or path.startswith("/files/")
+    exempt_path = path.startswith(AUTH_EXEMPT_PREFIXES)
+    if not _stateless_only() and settings.require_api_auth and protected_path and not exempt_path and not _authorized(request):
+        return JSONResponse({"detail": "Authentication required."}, status_code=status.HTTP_401_UNAUTHORIZED)
+    return await call_next(request)
+
+
+if not _stateless_only() and _public_files_enabled():
+    app.mount("/files", StaticFiles(directory=settings.output_dir), name="files")
 
 
 @app.get("/api/config", response_model=RuntimeConfigResponse)
@@ -496,6 +807,25 @@ async def runtime_config() -> RuntimeConfigResponse:
 @app.get("/api/app-settings", response_model=AppSettingsResponse)
 async def get_app_settings() -> AppSettingsResponse:
     return _app_settings_response()
+
+
+@app.get("/api/provider-usage")
+async def provider_usage() -> dict[str, object]:
+    data = _read_app_settings_secret()
+    codex_status = await asyncio.to_thread(codex_runner.account_status, force=True)
+    abacus_usage = provider_usage_store.read()["abacus"]
+    return {
+        "default_provider": str(data.get("llm_provider") or "auto"),
+        "auto_provider_order": list(settings.auto_provider_order or ("codex", "abacus")),
+        "codex": codex_status,
+        "abacus": {
+            "configured": bool(str(data.get("abacus_api_key") or "").strip()),
+            "available": bool(str(data.get("abacus_api_key") or "").strip())
+            and not provider_usage_store.abacus_quota_blocked(),
+            "balance_supported": False,
+            "usage": abacus_usage,
+        },
+    }
 
 
 @app.post("/api/app-settings", response_model=AppSettingsResponse)
@@ -609,8 +939,14 @@ async def save_profile(payload: SaveProfileBundleRequest) -> ProfileBundle:
 
 @app.get("/api/health")
 async def healthcheck() -> dict[str, str]:
-    mode = "live" if _resume_generator().has_live_model() else "demo"
+    generator = _stateless_generator() if _stateless_only() else _resume_generator()
+    mode = "live" if generator.has_live_model() else "demo"
     return {"status": "ok", "mode": mode}
+
+
+@app.post("/api/stateless/generate", response_model=StatelessGenerateResponse)
+async def stateless_generate(payload: StatelessGenerateRequest) -> StatelessGenerateResponse:
+    return await asyncio.to_thread(_run_stateless_generation, payload)
 
 
 @app.post("/api/generate", response_model=GenerateResponse, status_code=202)
@@ -627,6 +963,8 @@ async def generate_resume(
             "label": payload.label,
             "source_url": payload.source_url,
             "job_description": payload.job_description,
+            "requested_provider": payload.provider
+            or str(_read_app_settings_secret().get("llm_provider") or "auto"),
         },
     )
     _job_control(job_id)
@@ -657,7 +995,7 @@ async def edit_preview(payload: EditPreviewRequest) -> EditPreviewResponse:
         edit_instructions=payload.edit_instructions,
     )
     edited_draft = await asyncio.to_thread(
-        _resume_generator().generate_resume,
+        _generator_for_source(payload.source_job_id).generate_resume,
         profile,
         request,
         1,
@@ -693,7 +1031,7 @@ async def score_existing_resume(payload: ScoreResumeRequest) -> ScoreResumeRespo
         else None
     )
     report = await asyncio.to_thread(
-        _resume_generator().score_resume,
+        _generator_for_source(payload.source_job_id).score_resume,
         profile,
         request,
         draft,
@@ -706,6 +1044,202 @@ async def score_existing_resume(payload: ScoreResumeRequest) -> ScoreResumeRespo
         used_original_job_description=payload.job_description is None,
         report=report,
     )
+
+
+@app.post("/api/cover-letter", response_model=CoverLetterResponse)
+async def generate_cover_letter(payload: CoverLetterRequest) -> CoverLetterResponse:
+    try:
+        source_job = job_store.load(payload.source_job_id)
+        draft = _load_stored_draft(payload.source_job_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="Completed source CV not found") from exc
+    if source_job.status != "completed":
+        raise HTTPException(status_code=409, detail="Cover letters require a completed CV")
+    job_description = str(source_job.extra.get("job_description", "")).strip()
+    if not job_description:
+        raise HTTPException(status_code=409, detail="Original job description is missing")
+
+    profile_dir = _profile_dir()
+    profile = await asyncio.to_thread(load_profile_data, profile_dir)
+    content = await asyncio.to_thread(
+        _generator_for_source(payload.source_job_id).generate_cover_letter,
+        profile,
+        job_description,
+        draft,
+        payload.instructions,
+    )
+    return await _finalize_cover_letter(
+        source_job,
+        draft,
+        profile,
+        profile_dir,
+        job_description,
+        content,
+        company_override=cover_letter_company_edit(payload.instructions),
+    )
+
+
+@app.post("/api/cover-letter/edit", response_model=CoverLetterResponse)
+async def edit_cover_letter(payload: CoverLetterEditRequest) -> CoverLetterResponse:
+    try:
+        source_job = job_store.load(payload.source_job_id)
+        draft = _load_stored_draft(payload.source_job_id)
+        previous_path = settings.output_dir / payload.source_job_id / "cover-letter.txt"
+        previous_content = previous_path.read_text(encoding="utf-8")
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="Generate a cover letter for this job first") from exc
+    if source_job.status != "completed":
+        raise HTTPException(status_code=409, detail="Cover-letter edits require a completed CV")
+    job_description = str(source_job.extra.get("job_description", "")).strip()
+    if not job_description:
+        raise HTTPException(status_code=409, detail="Original job description is missing")
+
+    profile_dir = _profile_dir()
+    profile = await asyncio.to_thread(load_profile_data, profile_dir)
+    company_override = cover_letter_company_edit(payload.instructions)
+    if is_header_only_cover_letter_edit(payload.instructions, company_override):
+        content = previous_content
+    else:
+        content = await asyncio.to_thread(
+            _generator_for_source(payload.source_job_id).generate_cover_letter,
+            profile,
+            job_description,
+            draft,
+            payload.instructions,
+            previous_content,
+        )
+    return await _finalize_cover_letter(
+        source_job,
+        draft,
+        profile,
+        profile_dir,
+        job_description,
+        content,
+        preserve_previous=True,
+        company_override=company_override,
+    )
+
+
+async def _finalize_cover_letter(
+    source_job: JobMetadata,
+    draft: ResumeDraft,
+    profile: ProfileData,
+    profile_dir: Path,
+    job_description: str,
+    content: str,
+    *,
+    preserve_previous: bool = False,
+    company_override: str | None = None,
+) -> CoverLetterResponse:
+    template_path = profile_dir / "templates" / "cover_letter.typ"
+    if not template_path.exists():
+        template_path = _example_profile_dir() / "templates" / "cover_letter.typ"
+    if not template_path.exists():
+        raise HTTPException(status_code=500, detail="Cover-letter Typst template is missing")
+
+    contact = extract_contact_fields(profile.master_profile)
+    contact.update(
+        {
+            "name": draft.contact.name or contact.get("name", "Applicant"),
+            "email": draft.contact.email or contact.get("email", ""),
+            "location": draft.contact.location or contact.get("location", ""),
+        }
+    )
+    portrait_path = profile_dir / "assets" / "cover-letter-portrait-circle.png"
+    if not portrait_path.exists():
+        portrait_path = profile_dir / "assets" / "cover-letter-portrait.jpg"
+    assets: dict[str, bytes] = {}
+    portrait_filename: str | None = None
+    if portrait_path.exists():
+        portrait_filename = portrait_path.name
+        assets[portrait_filename] = portrait_path.read_bytes()
+    label = str(source_job.extra.get("label", "")).strip()
+    company = company_override or _cover_letter_company(
+        job_description, source_job.extra.get("source_url", ""), label
+    )
+    template = template_path.read_text(encoding="utf-8-sig")
+    required_template_markers = {
+        "{{BODY}}",
+        "{{BODY_FONT_SIZE}}",
+        "{{SIGNATURE_NAME}}",
+        "measure(letter-body)",
+        "cover letter body exceeds signature safety area",
+    }
+    missing_markers = sorted(
+        marker for marker in required_template_markers if marker not in template
+    )
+    if missing_markers:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Cover-letter template is missing required layout-verification markers: "
+                + ", ".join(missing_markers)
+            ),
+        )
+    compiled = None
+    typst_source = ""
+    body_font_size = 0.0
+    last_error = ""
+    content_candidates = [content]
+    compacted_content = compact_cover_letter(content)
+    if compacted_content != content:
+        content_candidates.append(compacted_content)
+    for candidate_content in content_candidates:
+        content = candidate_content
+        for body_font_size, paragraph_gap in ((9.7, 3.2), (9.2, 2.8), (8.8, 2.4)):
+            typst_source = render_cover_letter(
+                template,
+                content,
+                contact,
+                portrait_filename=portrait_filename,
+                company=company,
+                recipient="Hiring Manager",
+                body_font_size=body_font_size,
+                paragraph_gap_mm=paragraph_gap,
+            )
+            compiled = await compiler_client.compile(typst_source, assets)
+            last_error = compiled.compile_log
+            if compiled.success and compiled.pdf_base64 and compiled.page_count == 1:
+                break
+            if "cover letter body exceeds signature safety area" not in last_error:
+                break
+        if compiled and compiled.success and compiled.pdf_base64 and compiled.page_count == 1:
+            break
+        if "cover letter body exceeds signature safety area" not in last_error:
+            break
+    if compiled is None or not compiled.success or not compiled.pdf_base64:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Cover-letter layout verification failed: {last_error[:500]}",
+        )
+    if compiled.page_count != 1:
+        raise HTTPException(status_code=502, detail="Cover letter did not compile to exactly one page")
+
+    filename = f"cover-letter-{_safe_part(draft.job_title or label or 'job', 45)}.pdf"
+    pdf_bytes = base64.b64decode(compiled.pdf_base64)
+    if preserve_previous:
+        artifact_dir = settings.output_dir / source_job.job_id
+        for artifact_name in ("cover-letter.txt", "cover-letter.typ", "cover-letter.pdf"):
+            artifact_path = artifact_dir / artifact_name
+            if artifact_path.exists():
+                shutil.copyfile(artifact_path, artifact_dir / artifact_name.replace("cover-letter", "cover-letter.previous"))
+    job_store.write_text_artifact(source_job.job_id, "cover-letter.txt", content)
+    job_store.write_text_artifact(source_job.job_id, "cover-letter.typ", typst_source)
+    job_store.write_binary_artifact(source_job.job_id, "cover-letter.pdf", pdf_bytes)
+    return CoverLetterResponse(
+        source_job_id=source_job.job_id,
+        filename=filename,
+        content=content,
+        pdf_base64=compiled.pdf_base64,
+        page_count=compiled.page_count,
+        one_page_verified=True,
+        non_overlap_verified=True,
+        body_font_size=body_font_size,
+    )
+
+
+def _cover_letter_company(job_description: str, source_url: str, label: str) -> str:
+    return infer_cover_letter_company(job_description, source_url, label)
 
 
 def _safe_part(s: str, max_len: int = 30) -> str:
@@ -753,6 +1287,80 @@ def _load_stored_draft(job_id: str) -> ResumeDraft:
     return ResumeDraft.model_validate_json(draft_path.read_text(encoding="utf-8"))
 
 
+def _dir_size(path: Path) -> int:
+    if not path.exists():
+        return 0
+    return sum(item.stat().st_size for item in path.rglob("*") if item.is_file())
+
+
+def _load_job_metadata() -> list[JobMetadata]:
+    jobs: list[JobMetadata] = []
+    if not settings.output_dir.exists():
+        return jobs
+    for job_dir in settings.output_dir.iterdir():
+        meta_path = job_dir / "metadata.json"
+        if not meta_path.exists():
+            continue
+        try:
+            jobs.append(JobMetadata.model_validate_json(meta_path.read_text(encoding="utf-8")))
+        except Exception:
+            continue
+    return jobs
+
+
+def _cleanup_summary(deleted_job_ids: list[str] | None = None, bytes_before: int | None = None) -> OutputCleanupResponse:
+    jobs = _load_job_metadata()
+    total_jobs = len(jobs)
+    terminal_jobs = sum(1 for job in jobs if job.status in TERMINAL_STATUSES)
+    active_jobs = total_jobs - terminal_jobs
+    bytes_after = _dir_size(settings.output_dir)
+    deleted = deleted_job_ids or []
+    return OutputCleanupResponse(
+        output_dir=str(settings.output_dir),
+        total_jobs=total_jobs,
+        terminal_jobs=terminal_jobs,
+        active_jobs=active_jobs,
+        deleted_jobs=len(deleted),
+        deleted_job_ids=deleted,
+        retained_jobs=total_jobs,
+        bytes_before=bytes_after if bytes_before is None else bytes_before,
+        bytes_after=bytes_after,
+    )
+
+
+@app.get("/api/outputs/summary", response_model=OutputCleanupResponse)
+async def output_summary() -> OutputCleanupResponse:
+    return _cleanup_summary()
+
+
+@app.post("/api/outputs/cleanup", response_model=OutputCleanupResponse)
+async def cleanup_outputs(payload: OutputCleanupRequest) -> OutputCleanupResponse:
+    bytes_before = _dir_size(settings.output_dir)
+    cutoff = datetime.now(UTC) - timedelta(days=payload.older_than_days)
+    deleted: list[str] = []
+    for metadata in _load_job_metadata():
+        if metadata.status not in TERMINAL_STATUSES:
+            continue
+        if metadata.status == "failed" and not payload.include_failed:
+            continue
+        if metadata.status == "stopped" and not payload.include_stopped:
+            continue
+        if not payload.delete_all_terminal and metadata.created_at > cutoff:
+            continue
+        control = job_controls.get(metadata.job_id)
+        if control is not None and control.task is not None and not control.task.done():
+            continue
+        try:
+            job_store.delete(metadata.job_id)
+            job_controls.pop(metadata.job_id, None)
+            deleted.append(metadata.job_id)
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise HTTPException(status_code=500, detail=f"Failed to delete job '{metadata.job_id}'") from exc
+    return _cleanup_summary(deleted, bytes_before)
+
+
 @app.get("/api/jobs")
 async def list_jobs() -> list[dict]:
     """List all jobs sorted newest first."""
@@ -769,6 +1377,7 @@ async def list_jobs() -> list[dict]:
                 "label": meta.extra.get("label", ""),
                 "job_title": meta.extra.get("job_title", ""),
                 "created_at": meta.created_at.isoformat(),
+                "cover_letter_exists": (job_dir / "cover-letter.txt").exists(),
             })
         except Exception:
             continue
@@ -894,9 +1503,78 @@ def _score_report_text(report: ResumeScoreReport) -> str:
 
 
 async def run_generation_job(job_id: str, payload: GenerateRequest) -> None:
-    metadata = job_store.load(job_id)
     control = _job_control(job_id)
     control.task = asyncio.current_task()
+    candidates = await asyncio.to_thread(
+        _provider_candidates, payload.provider, payload.source_job_id
+    )
+    quota_failures: list[str] = []
+    try:
+        if not candidates:
+            raise RuntimeError(
+                "No live provider is available. Log Codex in inside the API container "
+                "or configure an Abacus API key."
+            )
+        for index, provider in enumerate(candidates):
+            metadata = job_store.load(job_id)
+            metadata = job_store.record_status(
+                metadata,
+                status="running",
+                stage="provider_fallback" if index else "loading_profile",
+                error=None,
+                extra={
+                    **metadata.extra,
+                    "actual_provider": provider,
+                    "provider_attempt": index + 1,
+                    "provider_quota_failures": quota_failures,
+                },
+            )
+            try:
+                await _run_generation_job_once(
+                    job_id,
+                    payload,
+                    _resume_generator(provider),
+                    control,
+                )
+                return
+            except ProviderQuotaError as exc:
+                quota_failures.append(f"{provider}: {str(exc)[:500]}")
+                if index + 1 < len(candidates):
+                    continue
+                job_store.record_status(
+                    job_store.load(job_id),
+                    status="failed",
+                    stage="failed",
+                    error="All selected providers are out of credits or quota.",
+                    extra={
+                        **job_store.load(job_id).extra,
+                        "provider_quota_failures": quota_failures,
+                    },
+                )
+                return
+    except asyncio.CancelledError:
+        metadata = job_store.load(job_id)
+        _stop_metadata(metadata, error="Stopped by user.")
+    except Exception as exc:
+        metadata = job_store.load(job_id)
+        job_store.record_status(
+            metadata,
+            status="failed",
+            stage="failed",
+            error=str(exc),
+        )
+    finally:
+        control.task = None
+        job_controls.pop(job_id, None)
+
+
+async def _run_generation_job_once(
+    job_id: str,
+    payload: GenerateRequest,
+    generator: ResumeGenerator,
+    control: JobControl,
+) -> None:
+    metadata = job_store.load(job_id)
     compile_logs: list[str] = []
     last_page_count: int | None = None
     last_typst_source = ""
@@ -1118,7 +1796,7 @@ async def run_generation_job(job_id: str, payload: GenerateRequest) -> None:
                     f"log={compile_logs[-2] if len(compile_logs) >= 2 else 'n/a'}"
                 )
                 approved_draft = await asyncio.to_thread(
-                    _resume_generator().generate_resume,
+                    generator.generate_resume,
                     profile,
                     retry_payload,
                     2,
@@ -1181,7 +1859,7 @@ async def run_generation_job(job_id: str, payload: GenerateRequest) -> None:
                 recommendations=scorer_feedback.recommendations if scorer_feedback else [],
             )
             draft = await asyncio.to_thread(
-                _resume_generator().generate_resume,
+                generator.generate_resume,
                 profile,
                 payload,
                 attempt,
@@ -1228,7 +1906,7 @@ async def run_generation_job(job_id: str, payload: GenerateRequest) -> None:
                     page_count=last_page_count,
                 )
                 scorer_feedback = await asyncio.to_thread(
-                    _resume_generator().score_resume,
+                    generator.score_resume,
                     profile,
                     payload,
                     draft,
@@ -1299,6 +1977,8 @@ async def run_generation_job(job_id: str, payload: GenerateRequest) -> None:
             keywords=draft.keywords if draft else [],
             recommendations=last_score_report.recommendations if last_score_report else [],
         )
+    except ProviderQuotaError:
+        raise
     except asyncio.CancelledError:
         if last_typst_source:
             job_store.write_text_artifact(job_id, "resume.typ", last_typst_source)
@@ -1333,6 +2013,3 @@ async def run_generation_job(job_id: str, payload: GenerateRequest) -> None:
             score_band=last_score_report.score_band if last_score_report else None,
             recommendations=last_score_report.recommendations if last_score_report else [],
         )
-    finally:
-        control.task = None
-        job_controls.pop(job_id, None)

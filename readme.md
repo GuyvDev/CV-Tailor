@@ -10,17 +10,19 @@ The app runs as a Docker Compose stack:
 
 - Accepts a pasted job description.
 - Reads private profile files from `data/profile/` or another `PROFILE_DIR`.
-- Uses OpenAI or an OpenAI-compatible Abacus endpoint to draft a tailored resume.
+- Uses a signed-in Codex/ChatGPT account or Abacus RouteLLM, with per-job provider selection and automatic quota fallback.
 - Scores the draft for role fit, ATS clarity, credibility, and one-page discipline.
 - Renders a deterministic Typst resume and compiles it to PDF.
+- Generates and edits one-page, fully justified cover letters from each saved job and tailored CV.
+- Provides Telegram commands for generation, review, editing, cover letters, provider selection, and usage limits.
 - Stores generated artifacts under `outputs/<job_id>/`.
 - Provides a Personalize tab for editing your local profile files without committing them.
 
 ## Setup
 
 1. Copy `.env.example` to `.env`.
-2. Choose `LLM_PROVIDER=openai` or `LLM_PROVIDER=abacus`.
-3. Optionally set `OPENAI_API_KEY` or `ABACUS_API_KEY`, or keep `ENABLE_DEMO_MODE=true` for a smoke test. You can also add API keys later from the web UI.
+2. Keep `LLM_PROVIDER=auto` to prefer a signed-in Codex account and fall back to Abacus, or choose `codex`, `abacus`, or `openai` explicitly.
+3. Sign Codex in inside Docker as described below, optionally set `ABACUS_API_KEY` as the fallback, or keep `ENABLE_DEMO_MODE=true` for a smoke test.
 4. Start the stack:
 
 ```bash
@@ -30,7 +32,41 @@ docker compose up --build
 5. Open `http://localhost:3000`.
 6. Use the Personalize tab to create or switch profiles, configure provider/model/API keys, output filename, and private profile data.
 
+To enable the private Telegram bot, configure its token and allowed user IDs, then start the
+`telegram` profile:
+
+```bash
+docker compose --profile telegram up --build -d
+```
+
 The API is available at `http://localhost:8000`.
+
+## Deployment Modes
+
+Use the two Compose files for different jobs:
+
+| Mode | File | Best for | Stores profile/jobs/files | Telegram | Public internet |
+| --- | --- | --- | --- | --- | --- |
+| Private stateful | `docker-compose.yml` | Local use, private VPS, Telegram workflow | Yes | Yes | Only behind VPN/reverse-proxy auth |
+| Public stateless | `docker-compose.stateless.yml` or Vercel | Simple public/demo CV generation | No | No | Yes, with HTTPS and rate limits |
+
+The regular Docker stack is intentionally stateful. It mounts `./data` and `./outputs`, keeps job history, and runs the optional Telegram bot. The stateless stack is separate and does not mount private profile/output directories into the API container.
+
+## Production Safety
+
+Public/stateless deployments should use HTTPS, request-size limits, rate limiting, and access logs without request bodies. Private/stateful deployments should stay on localhost, a VPN, or behind your own authentication layer because the API can read and write private profile data, saved provider settings, and generated resume files.
+
+If you expose the API directly rather than through the included Caddy production stack, set:
+
+```env
+APP_ENV=production
+REQUIRE_API_AUTH=true
+API_AUTH_TOKEN=generate-a-long-random-token
+API_ALLOWED_ORIGINS=https://your-frontend.example
+ENABLE_DEMO_MODE=false
+```
+
+When `APP_ENV=production` or `REQUIRE_API_AUTH=true`, private stateful endpoints fail closed unless `API_AUTH_TOKEN` is configured. Requests to those endpoints must send `Authorization: Bearer <API_AUTH_TOKEN>` or `X-API-Token: <API_AUTH_TOKEN>`. For browser-facing production use, prefer putting the API behind a reverse proxy that injects the token or performs its own auth; do not publish a long-lived admin token in frontend JavaScript. The included stateful production Compose file instead keeps the API private on the Docker network and protects the entire frontend/API with Caddy Basic Auth. Production mode also disables `/docs`, `/redoc`, and `/openapi.json`.
 
 ## Profile Files
 
@@ -46,6 +82,8 @@ Each profile can contain:
 - `personalization.json`
 - `app_settings.json`
 - `templates/base_resume.typ`
+- `templates/cover_letter.typ`
+- optional `assets/cover-letter-portrait-circle.png` or `assets/cover-letter-portrait.jpg`
 - optional `examples/*.md`
 - optional `notes/*.md`
 
@@ -75,13 +113,184 @@ Provider, model, API keys, and output filename can be edited in the web UI and a
 
 The AI Setup Draft tool can convert rough notes, an existing CV, and preferences into draft profile files. It loads the draft into the editor for review; it does not save until you press Save.
 
-## API Keys
+## Provider credentials
 
-The web UI intentionally does not display stored secret values. Edit `.env`, then restart Docker:
+Codex uses ChatGPT device authentication and does not require `OPENAI_API_KEY`. Abacus and the
+legacy direct OpenAI provider use their respective API keys. The web UI intentionally does not
+display stored secret values. Edit `.env`, then restart Docker:
 
 ```bash
 docker compose restart api telegram-bot
 ```
+
+## Codex account authentication in Docker
+
+The stateful API image includes a pinned Codex CLI. Its ChatGPT login is stored in the private
+`codex_auth` Docker volume and refreshed there by Codex. It is never copied into the repository.
+
+Build and start the API, then complete device-code login inside the running container:
+
+```bash
+docker compose up --build -d api typst-compiler
+docker compose exec api codex login --device-auth
+docker compose exec api codex login status
+```
+
+For the production Compose file, include the same file and environment file in these commands.
+Do not publish or back up the contents of `/app/.codex/auth.json` as ordinary application data;
+it contains refreshable account credentials.
+
+Provider behavior:
+
+- `LLM_PROVIDER=codex` always uses the signed-in ChatGPT/Codex account.
+- `LLM_PROVIDER=abacus` always uses RouteLLM.
+- `LLM_PROVIDER=auto` checks Codex rate-limit windows first, then Abacus. If a provider returns a
+  quota/credits failure, the complete generation-and-review cycle is restarted on the fallback so
+  one provider never generates a CV while another reviews that same attempt.
+- Telegram `/provider` selects Auto, Codex, or Abacus for new jobs. `/usage` displays Codex quota
+  windows and locally observed Abacus request/token totals. RouteLLM does not document a remaining
+  account-balance endpoint, so the bot reports its most recent quota response instead.
+
+## Cover letters and template customization
+
+Cover letters are generated from the active private profile, the saved job description, and the
+tailored CV. They reuse the provider recorded on the source CV. The API compiles exactly one page,
+measures the complete body before placing the signature, tries progressively tighter readable
+font settings, and compacts model output above 200 words if necessary. Body paragraphs are fully
+justified by default.
+
+The public-safe default template is
+`data/profile.example/templates/cover_letter.typ`. Copy it to
+`data/profile/templates/cover_letter.typ` for a private customization. It contains placeholders
+such as `{{NAME}}`, `{{EMAIL}}`, `{{PHONE}}`, `{{LOCATION}}`, `{{COMPANY}}`, `{{BODY}}`, and
+`{{PORTRAIT}}`; it contains no real contact details. Keep personal values and portrait images only
+under the ignored `data/profile/` directory. The bundled Poppins font files are distributed with
+their SIL Open Font License under `compiler/fonts/OFL.txt`.
+
+Telegram commands:
+
+```text
+/coverletter
+/coverletter <job-id-or-label> [instructions]
+/editcoverletter
+/editcoverletter <job-id-or-label> <instructions>
+```
+
+The interactive forms show eligible saved jobs. Edits retain the immediately previous TXT, Typst,
+and PDF artifacts as `cover-letter.previous.*`.
+
+
+
+## Vercel Hobby Deployment
+
+The generated one-page PDFs from the Gemini/GPT comparison were about 32 KB, far below Vercel's 4.5 MB function payload limit for normal CV output. The `stateless-vps` branch now also supports a Vercel deployment path.
+
+Deploy from the `frontend/` directory as the Vercel project root. The frontend contains:
+
+- `api/stateless/generate.ts` - Vercel Function for Gemini Flash generation and Typst PDF compilation.
+- `vercel.json` - 300 second function duration and 2 GB memory configuration.
+
+Set these Vercel environment variables:
+
+```env
+FLASH_API_KEY=your-google-ai-studio-key
+STATELESS_MODEL_NAME=gemini-2.5-flash
+VITE_STATELESS_ONLY=true
+UPSTASH_REDIS_REST_URL=your-upstash-rest-url
+UPSTASH_REDIS_REST_TOKEN=your-upstash-rest-token
+```
+
+Recommended Vercel settings:
+
+- Root Directory: `frontend`
+- Build Command: `npm run build`
+- Output Directory: `dist`
+- Install Command: `npm install`
+
+The Vercel path is fully stateless: the function returns the PDF and Typst source in the JSON response and does not create profiles, jobs, or output files. It enforces 5 valid generation starts per IP address per hour, 100 valid generation starts per UTC day across the site, a 128 KB request limit, per-field character limits, a 5,000-token ceiling for CV drafting, and a 1,000-token ceiling for scoring. Without Upstash, the counters are best-effort per warm Vercel instance; add the optional Upstash variables for durable shared limits. The rate-limit store contains only hashed IP identifiers and numeric counters; it does not receive CV content. Keep request-body logging disabled and also configure a matching Vercel Firewall IP rate-limit rule before sharing the URL widely.
+
+## Stateless VPS Deployment
+
+The `stateless-vps` branch adds a public-facing mode for simple input-output CV generation. In this mode the API accepts candidate data and a job description, calls the configured model, compiles Typst, and returns PDF bytes plus Typst source directly in the response. It does not create profiles, jobs, or output files on the API service.
+
+Recommended architecture:
+
+- Run `frontend`, `api`, and `typst-compiler` with `docker-compose.stateless.yml`.
+- Put the VPS behind HTTPS with Caddy, Nginx, Cloudflare Tunnel, or another reverse proxy.
+- Set `STATELESS_ONLY=true` so profile/job persistence endpoints return 404.
+- Set `APP_ENV=production`, `API_ENABLE_DOCS=false`, and `API_PUBLIC_FILES_ENABLED=false`.
+- Set `API_ALLOWED_ORIGINS` to the exact HTTPS frontend origin if the browser calls the API cross-origin; leave it empty for same-origin reverse-proxy deployments.
+- Keep `FLASH_API_KEY` only in `.env` on the VPS.
+- Add reverse-proxy request size limits, rate limits, and access logs without request bodies.
+
+Minimal `.env` for Gemini Flash:
+
+```env
+FLASH_API_KEY=your-google-ai-studio-key
+STATELESS_ONLY=true
+STATELESS_LLM_PROVIDER=gemini
+STATELESS_MODEL_NAME=gemini-2.5-flash
+STATELESS_BASE_URL=https://generativelanguage.googleapis.com/v1beta/openai
+STATELESS_ENABLE_DEMO_MODE=false
+APP_ENV=production
+API_ENABLE_DOCS=false
+API_PUBLIC_FILES_ENABLED=false
+API_ALLOWED_ORIGINS=
+FRONTEND_PORT=3000
+API_PORT=8000
+```
+
+Run locally or on the VPS:
+
+```bash
+docker compose -f docker-compose.stateless.yml up --build -d
+```
+
+The stateless compose file does not mount `data/` or `outputs/` into the API container. The API container is read-only and uses `tmpfs` for `/tmp`; the compiler also uses `tmpfs`. Generated PDFs are returned to the browser instead of written to `outputs/`.
+
+For production, prefer exposing only the frontend through HTTPS and keeping the API reachable only from the reverse proxy or private network. Even stateless CV generation still handles private text in memory, so do not log request bodies. Do not deploy the stateful `docker-compose.yml` stack publicly unless you add authentication and intentionally enable file serving.
+
+## Output Retention
+
+The Personalize tab includes an Output Retention panel for the stateful app. It shows the output directory, stored job count, active jobs, and archive size. You can delete terminal jobs older than a chosen number of days or delete all terminal job archives. Running/queued jobs are retained.
+
+The same behavior is available through:
+
+- `GET /api/outputs/summary`
+- `POST /api/outputs/cleanup` with `older_than_days`, `include_failed`, `include_stopped`, and `delete_all_terminal`
+
+
+## Stateful Production Docker
+
+The regular `docker-compose.yml` stays as the local/private stateful stack and is not changed by the production setup below. For a stateful production deployment, use the separate Caddy-backed compose file:
+
+```bash
+cp .env.stateful.production.example .env.stateful.production
+# edit domain, Caddy password hash, model keys, and optional Telegram values
+docker compose --env-file .env.stateful.production -f docker-compose.stateful.prod.yml up --build -d
+```
+
+This production stack is isolated from your current running data by default:
+
+- `docker-compose.yml` uses `./data` and `./outputs`.
+- `docker-compose.stateful.prod.yml` uses `./data.prod` and `./outputs.prod` unless you change `STATEFUL_DATA_DIR` or `STATEFUL_OUTPUT_DIR`.
+- The API and Typst compiler ports are not published; Caddy is the only public entrypoint.
+- Caddy protects the entire app with Basic Auth before traffic reaches the frontend/API.
+- API docs are disabled, CORS is same-origin, demo mode is off by default, and the compiler runs read-only with tmpfs.
+
+Generate the Caddy password hash with:
+
+```bash
+docker run --rm caddy:2.8-alpine caddy hash-password --plaintext 'your-long-password'
+```
+
+Put the resulting hash in `STATEFUL_BASIC_AUTH_HASH`. The public Stateless page includes a clearly labeled video showcase for the separate Stateful Docker + Telegram edition. The video is informational only: the Stateless Vercel app does not save profiles, job history, or connect a Telegram bot. To override the showcase video, set `VITE_DEMO_VIDEO_URL` to a public HTTPS MP4 URL before building. To include Telegram in the Stateful stack, add `--profile telegram`:
+
+```bash
+docker compose --env-file .env.stateful.production -f docker-compose.stateful.prod.yml --profile telegram up --build -d
+```
+
+If you intentionally want production to use your current local data, set `STATEFUL_DATA_DIR=./data` and `STATEFUL_OUTPUT_DIR=./outputs`. Otherwise leave the defaults so production cannot alter your local working profile and generated resumes.
 
 ## Telegram Bot Setup
 
@@ -95,6 +304,8 @@ The Telegram bot is optional. It talks to the API service inside Docker and uses
 TELEGRAM_BOT_TOKEN=123456:your-token
 TELEGRAM_ALLOWED_USER_IDS=123456789
 API_URL=http://api:8000
+# Only needed if REQUIRE_API_AUTH=true or APP_ENV=production for the stateful API.
+API_AUTH_TOKEN=the-same-token-used-by-api
 ```
 
 4. Start the stack with the bot:
@@ -106,11 +317,24 @@ docker compose up --build frontend api typst-compiler telegram-bot
 5. Open the web UI, choose the active profile, verify the output filename, and save settings.
 6. In Telegram, send or paste a job description using the commands shown by the bot. Generated PDFs are produced by the same API pipeline as the web UI.
 
+After a CV finishes, ask the bot for a cover letter tied to that saved job:
+
+```text
+/coverletter
+/coverletter <job-id-or-label>
+/coverletter <job-id-or-label> Emphasize systems work and rapid learning
+/editcoverletter
+/editcoverletter <job-id-or-label> Make the second paragraph shorter
+```
+
+With no argument, the bot shows completed jobs to pick from. It generates the letter from the active profile, the saved job description, and that job's tailored CV, then applies `templates/cover_letter.typ` and sends `cover-letter-<role>.pdf` in Telegram. Typst measures the complete body and rejects it if it enters the signature safety area; the API also rejects anything that is not exactly one page. It retries safe font densities and compacts overlong model output before failing. `/editcoverletter` revises the saved letter, reruns both layout gates, and keeps the immediately previous TXT, Typst, and PDF as `cover-letter.previous.*`. The latest artifacts are stored under `outputs/<job_id>/cover-letter.*`. An optional circular portrait can be placed at `assets/cover-letter-portrait-circle.png` inside the active profile.
+
 Operational notes:
 
-- Keep `TELEGRAM_ALLOWED_USER_IDS` set; otherwise anyone who gets the bot token may use your generator.
+- `TELEGRAM_ALLOWED_USER_IDS` is required. The bot refuses to start without an allowlist.
 - Rotate the bot token in BotFather if it is ever committed, shared, or exposed.
 - Restart `telegram-bot` after changing Telegram env values: `docker compose restart telegram-bot`.
+- The normal `docker-compose.yml` stack is stateful and keeps the Telegram workflow; `docker-compose.stateless.yml` is a separate public/demo deployment path.
 - The bot uses the active profile selected in the web UI. Switch profiles in the Personalize tab before sending Telegram jobs.
 
 AI helper prompt for Telegram setup:
@@ -130,9 +354,30 @@ python3 scripts/e2e_full_smoke.py
 
 The test creates a temporary profile under `data/profiles/`, switches to it, changes app settings, uses AI Setup Draft, saves generated profile files, creates a tailored CV, renders the PDF to `temp/e2e/*.png`, checks the image is nonblank, and restores the previously active profile.
 
+## CI and Publish Checklist
+
+GitHub Actions runs the publish audit, Python syntax checks, frontend build, and Docker Compose config validation for both deployment modes. Before the first GitHub commit or production deploy, run the local audit too:
+
+```bash
+./scripts/publish_audit.sh
+```
+
+Then initialize Git only after reviewing the staged file list:
+
+```bash
+git init
+git status --short --ignored
+git add .
+git status --short
+git commit -m "Initial public release"
+```
+
+If a secret or personal file is ever committed, remove it from history before pushing and rotate the affected key.
+
 ## Current Boundaries
 
 - File-backed job metadata, not a production database.
-- No authentication; run locally or add auth before deploying publicly.
+- Stateful mode has a simple bearer-token gate for private endpoints; use a reverse proxy, VPN, or full identity-aware auth for multi-user production.
+- Production mode disables docs and public `/files` serving by default when `APP_ENV=production` or `PRODUCTION=true`.
 - The profile editor is local-first and writes to `PROFILE_DIR`.
 - Demo mode is for smoke testing, not final resume quality.
