@@ -10,9 +10,11 @@ The app runs as a Docker Compose stack:
 
 - Accepts a pasted job description.
 - Reads private profile files from `data/profile/` or another `PROFILE_DIR`.
-- Uses OpenAI or an OpenAI-compatible Abacus endpoint to draft a tailored resume.
+- Uses a signed-in Codex/ChatGPT account or Abacus RouteLLM, with per-job provider selection and automatic quota fallback.
 - Scores the draft for role fit, ATS clarity, credibility, and one-page discipline.
 - Renders a deterministic Typst resume and compiles it to PDF.
+- Generates and edits one-page, fully justified cover letters from each saved job and tailored CV.
+- Provides Telegram commands for generation, review, editing, cover letters, provider selection, and usage limits.
 - Stores generated artifacts under `outputs/<job_id>/`.
 - Provides a Personalize tab for editing your local profile files without committing them.
 
@@ -36,8 +38,8 @@ Never commit your real API keys, contact details, grades, generated resumes, sca
 ## Setup
 
 1. Copy `.env.example` to `.env`.
-2. Choose `LLM_PROVIDER=openai` or `LLM_PROVIDER=abacus`.
-3. Optionally set `OPENAI_API_KEY` or `ABACUS_API_KEY`, or keep `ENABLE_DEMO_MODE=true` for a smoke test. You can also add API keys later from the web UI.
+2. Keep `LLM_PROVIDER=auto` to prefer a signed-in Codex account and fall back to Abacus, or choose `codex`, `abacus`, or `openai` explicitly.
+3. Sign Codex in inside Docker as described below, optionally set `ABACUS_API_KEY` as the fallback, or keep `ENABLE_DEMO_MODE=true` for a smoke test.
 4. Start the stack:
 
 ```bash
@@ -46,6 +48,13 @@ docker compose up --build
 
 5. Open `http://localhost:3000`.
 6. Use the Personalize tab to create or switch profiles, configure provider/model/API keys, output filename, and private profile data.
+
+To enable the private Telegram bot, configure its token and allowed user IDs, then start the
+`telegram` profile:
+
+```bash
+docker compose --profile telegram up --build -d
+```
 
 The API is available at `http://localhost:8000`.
 
@@ -64,7 +73,7 @@ The regular Docker stack is intentionally stateful. It mounts `./data` and `./ou
 
 Public/stateless deployments should use HTTPS, request-size limits, rate limiting, and access logs without request bodies. Private/stateful deployments should stay on localhost, a VPN, or behind your own authentication layer because the API can read and write private profile data, saved provider settings, and generated resume files.
 
-Before exposing the stateful API outside your machine, set:
+If you expose the API directly rather than through the included Caddy production stack, set:
 
 ```env
 APP_ENV=production
@@ -74,7 +83,7 @@ API_ALLOWED_ORIGINS=https://your-frontend.example
 ENABLE_DEMO_MODE=false
 ```
 
-When `APP_ENV=production` or `REQUIRE_API_AUTH=true`, private stateful endpoints fail closed unless `API_AUTH_TOKEN` is configured. Requests to those endpoints must send `Authorization: Bearer <API_AUTH_TOKEN>` or `X-API-Token: <API_AUTH_TOKEN>`. For browser-facing production use, prefer putting the API behind a reverse proxy that injects the token or performs its own auth; do not publish a long-lived admin token in frontend JavaScript. Production mode also disables `/docs`, `/redoc`, `/openapi.json`, and public `/files` serving by default unless you explicitly enable them.
+When `APP_ENV=production` or `REQUIRE_API_AUTH=true`, private stateful endpoints fail closed unless `API_AUTH_TOKEN` is configured. Requests to those endpoints must send `Authorization: Bearer <API_AUTH_TOKEN>` or `X-API-Token: <API_AUTH_TOKEN>`. For browser-facing production use, prefer putting the API behind a reverse proxy that injects the token or performs its own auth; do not publish a long-lived admin token in frontend JavaScript. The included stateful production Compose file instead keeps the API private on the Docker network and protects the entire frontend/API with Caddy Basic Auth. Production mode also disables `/docs`, `/redoc`, and `/openapi.json`.
 
 ## Profile Files
 
@@ -90,6 +99,8 @@ Each profile can contain:
 - `personalization.json`
 - `app_settings.json`
 - `templates/base_resume.typ`
+- `templates/cover_letter.typ`
+- optional `assets/cover-letter-portrait-circle.png` or `assets/cover-letter-portrait.jpg`
 - optional `examples/*.md`
 - optional `notes/*.md`
 
@@ -119,13 +130,71 @@ Provider, model, API keys, and output filename can be edited in the web UI and a
 
 The AI Setup Draft tool can convert rough notes, an existing CV, and preferences into draft profile files. It loads the draft into the editor for review; it does not save until you press Save.
 
-## API Keys
+## Provider credentials
 
-The web UI intentionally does not display stored secret values. Edit `.env`, then restart Docker:
+Codex uses ChatGPT device authentication and does not require `OPENAI_API_KEY`. Abacus and the
+legacy direct OpenAI provider use their respective API keys. The web UI intentionally does not
+display stored secret values. Edit `.env`, then restart Docker:
 
 ```bash
 docker compose restart api telegram-bot
 ```
+
+## Codex account authentication in Docker
+
+The stateful API image includes a pinned Codex CLI. Its ChatGPT login is stored in the private
+`codex_auth` Docker volume and refreshed there by Codex. It is never copied into the repository.
+
+Build and start the API, then complete device-code login inside the running container:
+
+```bash
+docker compose up --build -d api typst-compiler
+docker compose exec api codex login --device-auth
+docker compose exec api codex login status
+```
+
+For the production Compose file, include the same file and environment file in these commands.
+Do not publish or back up the contents of `/app/.codex/auth.json` as ordinary application data;
+it contains refreshable account credentials.
+
+Provider behavior:
+
+- `LLM_PROVIDER=codex` always uses the signed-in ChatGPT/Codex account.
+- `LLM_PROVIDER=abacus` always uses RouteLLM.
+- `LLM_PROVIDER=auto` checks Codex rate-limit windows first, then Abacus. If a provider returns a
+  quota/credits failure, the complete generation-and-review cycle is restarted on the fallback so
+  one provider never generates a CV while another reviews that same attempt.
+- Telegram `/provider` selects Auto, Codex, or Abacus for new jobs. `/usage` displays Codex quota
+  windows and locally observed Abacus request/token totals. RouteLLM does not document a remaining
+  account-balance endpoint, so the bot reports its most recent quota response instead.
+
+## Cover letters and template customization
+
+Cover letters are generated from the active private profile, the saved job description, and the
+tailored CV. They reuse the provider recorded on the source CV. The API compiles exactly one page,
+measures the complete body before placing the signature, tries progressively tighter readable
+font settings, and compacts model output above 200 words if necessary. Body paragraphs are fully
+justified by default.
+
+The public-safe default template is
+`data/profile.example/templates/cover_letter.typ`. Copy it to
+`data/profile/templates/cover_letter.typ` for a private customization. It contains placeholders
+such as `{{NAME}}`, `{{EMAIL}}`, `{{PHONE}}`, `{{LOCATION}}`, `{{COMPANY}}`, `{{BODY}}`, and
+`{{PORTRAIT}}`; it contains no real contact details. Keep personal values and portrait images only
+under the ignored `data/profile/` directory. The bundled Poppins font files are distributed with
+their SIL Open Font License under `compiler/fonts/OFL.txt`.
+
+Telegram commands:
+
+```text
+/coverletter
+/coverletter <job-id-or-label> [instructions]
+/editcoverletter
+/editcoverletter <job-id-or-label> <instructions>
+```
+
+The interactive forms show eligible saved jobs. Edits retain the immediately previous TXT, Typst,
+and PDF artifacts as `cover-letter.previous.*`.
 
 
 
@@ -265,9 +334,21 @@ docker compose up --build frontend api typst-compiler telegram-bot
 5. Open the web UI, choose the active profile, verify the output filename, and save settings.
 6. In Telegram, send or paste a job description using the commands shown by the bot. Generated PDFs are produced by the same API pipeline as the web UI.
 
+After a CV finishes, ask the bot for a cover letter tied to that saved job:
+
+```text
+/coverletter
+/coverletter <job-id-or-label>
+/coverletter <job-id-or-label> Emphasize systems work and rapid learning
+/editcoverletter
+/editcoverletter <job-id-or-label> Make the second paragraph shorter
+```
+
+With no argument, the bot shows completed jobs to pick from. It generates the letter from the active profile, the saved job description, and that job's tailored CV, then applies `templates/cover_letter.typ` and sends `cover-letter-<role>.pdf` in Telegram. Typst measures the complete body and rejects it if it enters the signature safety area; the API also rejects anything that is not exactly one page. It retries safe font densities and compacts overlong model output before failing. `/editcoverletter` revises the saved letter, reruns both layout gates, and keeps the immediately previous TXT, Typst, and PDF as `cover-letter.previous.*`. The latest artifacts are stored under `outputs/<job_id>/cover-letter.*`. An optional circular portrait can be placed at `assets/cover-letter-portrait-circle.png` inside the active profile.
+
 Operational notes:
 
-- Keep `TELEGRAM_ALLOWED_USER_IDS` set; otherwise anyone who gets the bot token may use your generator.
+- `TELEGRAM_ALLOWED_USER_IDS` is required. The bot refuses to start without an allowlist.
 - Rotate the bot token in BotFather if it is ever committed, shared, or exposed.
 - Restart `telegram-bot` after changing Telegram env values: `docker compose restart telegram-bot`.
 - The normal `docker-compose.yml` stack is stateful and keeps the Telegram workflow; `docker-compose.stateless.yml` is a separate public/demo deployment path.

@@ -11,6 +11,9 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl fontconfig fonts-dejavu xz-utils \
     && rm -rf /var/lib/apt/lists/*
 
+COPY fonts /usr/local/share/fonts/poppins
+RUN fc-cache -f
+
 RUN curl -fsSL "https://github.com/typst/typst/releases/download/v${TYPST_VERSION}/typst-x86_64-unknown-linux-musl.tar.xz" \
     | tar -xJ --strip-components=1 -C /usr/local/bin "typst-x86_64-unknown-linux-musl/typst"
 

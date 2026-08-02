@@ -80,6 +80,8 @@ type AppSettings = {
   enable_demo_mode: boolean;
   openai_api_key_configured: boolean;
   abacus_api_key_configured: boolean;
+  codex_installed: boolean;
+  codex_authenticated: boolean;
 };
 
 type DraftResponse = {
@@ -210,7 +212,7 @@ const roleOptions = [
 ];
 
 const emptyAppSettings: AppSettings = {
-  llm_provider: "openai",
+  llm_provider: "auto",
   model_name: "gpt-5-mini",
   reasoning_effort: "low",
   abacus_base_url: "https://routellm.abacus.ai/v1",
@@ -218,6 +220,8 @@ const emptyAppSettings: AppSettings = {
   enable_demo_mode: true,
   openai_api_key_configured: false,
   abacus_api_key_configured: false,
+  codex_installed: false,
+  codex_authenticated: false,
 };
 
 const emptyPersonalization: PersonalizationOptions = {
@@ -1156,6 +1160,8 @@ export function App() {
               <label className="field">
                 <span>Provider</span>
                 <select value={appSettings.llm_provider} onChange={(event) => setAppSettings({ ...appSettings, llm_provider: event.target.value })}>
+                  <option value="auto">Auto (Codex → Abacus)</option>
+                  <option value="codex">Codex account</option>
                   <option value="openai">OpenAI</option>
                   <option value="abacus">Abacus</option>
                 </select>
@@ -1164,6 +1170,10 @@ export function App() {
                 <span>Model</span>
                 <input value={appSettings.model_name} onChange={(event) => setAppSettings({ ...appSettings, model_name: event.target.value })} placeholder="gpt-5-mini" />
               </label>
+              <div className="field">
+                <span>Codex account</span>
+                <span>{appSettings.codex_authenticated ? "Signed in inside Docker" : appSettings.codex_installed ? "Installed; login required" : "Not installed"}</span>
+              </div>
               <label className="field">
                 <span>Reasoning effort</span>
                 <select value={appSettings.reasoning_effort} onChange={(event) => setAppSettings({ ...appSettings, reasoning_effort: event.target.value })}>

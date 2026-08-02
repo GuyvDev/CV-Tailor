@@ -2,11 +2,23 @@ name: CI
 
 on:
   push:
-    branches: [main, master]
+    branches: ['**']
   pull_request:
   workflow_dispatch:
 
 jobs:
+  privacy-audit:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check for private data and credentials
+        env:
+          LEAK_CHECK_TERMS: ${{ secrets.LEAK_CHECK_TERMS }}
+        run: python scripts/ci_privacy_audit.py
+
   audit-and-build:
     runs-on: ubuntu-latest
     steps:
@@ -25,6 +37,11 @@ jobs:
 
       - name: Python syntax check
         run: python -m py_compile api/app/*.py api/app/services/*.py compiler/app/*.py telegram-bot/app/*.py
+
+      - name: API unit tests
+        env:
+          PYTHONPATH: api
+        run: python -m unittest discover -s api/tests -v
 
       - name: Set up Node
         uses: actions/setup-node@v4

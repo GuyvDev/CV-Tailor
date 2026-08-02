@@ -1,6 +1,7 @@
 services:
   frontend:
     restart: unless-stopped
+    image: cv-docker-frontend-stateless
     build:
       context: ./frontend
       args:
@@ -14,8 +15,10 @@ services:
 
   api:
     restart: unless-stopped
+    image: cv-docker-api-stateless
     build:
       context: ./api
+      target: stateless
     environment:
       STATELESS_ONLY: "true"
       APP_ENV: ${APP_ENV:-production}

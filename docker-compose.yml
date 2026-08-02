@@ -12,6 +12,7 @@ x-dns-defaults: &dns_defaults
 services:
   frontend:
     <<: *runtime_defaults
+    image: cv-docker-frontend-stateful
     build:
       context: ./frontend
       args:
@@ -25,28 +26,43 @@ services:
 
   api:
     <<: [*runtime_defaults, *dns_defaults]
+    image: cv-docker-api-stateful
     build:
       context: ./api
-    env_file:
-      - .env
+      target: stateful
     environment:
-      LLM_PROVIDER: ${LLM_PROVIDER:-openai}
+      APP_ENV: ${APP_ENV:-development}
+      REQUIRE_API_AUTH: ${REQUIRE_API_AUTH:-false}
+      API_AUTH_TOKEN: ${API_AUTH_TOKEN:-}
+      API_ALLOWED_ORIGINS: ${API_ALLOWED_ORIGINS:-http://localhost:3000}
+      API_ENABLE_DOCS: ${API_ENABLE_DOCS:-true}
+      API_PUBLIC_FILES_ENABLED: ${API_PUBLIC_FILES_ENABLED:-true}
+      LLM_PROVIDER: ${LLM_PROVIDER:-auto}
       PROFILE_DIR: ${PROFILE_DIR:-/app/data/profile}
       OUTPUT_DIR: ${OUTPUT_DIR:-/app/outputs}
       COMPILER_URL: ${COMPILER_URL:-http://typst-compiler:8001}
       PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-http://localhost:8000}
       MAX_COMPILE_RETRIES: ${MAX_COMPILE_RETRIES:-4}
+      MAX_GENERATOR_RETRIES: ${MAX_GENERATOR_RETRIES:-2}
+      MAX_SCORER_RETRIES: ${MAX_SCORER_RETRIES:-2}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       ABACUS_API_KEY: ${ABACUS_API_KEY:-}
       ABACUS_BASE_URL: ${ABACUS_BASE_URL:-https://routellm.abacus.ai/v1}
       MODEL_NAME: ${MODEL_NAME:-gpt-5-mini}
       OPENAI_REASONING_EFFORT: ${OPENAI_REASONING_EFFORT:-low}
       ENABLE_DEMO_MODE: ${ENABLE_DEMO_MODE:-true}
+      OUTPUT_BASENAME: ${OUTPUT_BASENAME:-tailored-resume}
+      CODEX_HOME: /app/.codex
+      CODEX_MODEL: ${CODEX_MODEL:-gpt-5.6-terra}
+      CODEX_REASONING_EFFORT: ${CODEX_REASONING_EFFORT:-low}
+      CODEX_TIMEOUT_SECONDS: ${CODEX_TIMEOUT_SECONDS:-240}
+      AUTO_PROVIDER_ORDER: ${AUTO_PROVIDER_ORDER:-codex,abacus}
     ports:
       - "${API_PORT:-8000}:8000"
     volumes:
       - ./data:/app/data
       - ./outputs:/app/outputs
+      - codex_auth:/app/.codex
     healthcheck:
       test:
         [
@@ -86,14 +102,14 @@ services:
 
   telegram-bot:
     <<: [*runtime_defaults, *dns_defaults]
+    profiles: ["telegram"]
     build:
       context: ./telegram-bot
-    env_file:
-      - .env
     environment:
-      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
       TELEGRAM_ALLOWED_USER_IDS: ${TELEGRAM_ALLOWED_USER_IDS:-}
       API_URL: ${API_URL:-http://api:8000}
+      API_AUTH_TOKEN: ${API_AUTH_TOKEN:-}
       OUTPUT_BASENAME: ${OUTPUT_BASENAME:-tailored-resume}
     depends_on:
       api:
@@ -104,3 +120,6 @@ networks:
     driver: bridge
     driver_opts:
       com.docker.network.driver.mtu: 1400
+
+volumes:
+  codex_auth:

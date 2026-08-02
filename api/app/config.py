@@ -19,6 +19,11 @@ class Settings:
     abacus_base_url: str
     model_name: str
     reasoning_effort: str
+    codex_model_name: str
+    codex_reasoning_effort: str
+    codex_timeout_seconds: int
+    codex_work_dir: Path
+    auto_provider_order: tuple[str, ...]
     max_compile_retries: int
     max_generator_retries: int
     max_scorer_retries: int
@@ -52,7 +57,7 @@ def get_settings() -> Settings:
     if allowed_origins is None:
         allowed_origins = os.getenv("CORS_ALLOWED_ORIGINS")
     return Settings(
-        llm_provider=os.getenv("LLM_PROVIDER", "openai").strip().lower(),
+        llm_provider=os.getenv("LLM_PROVIDER", "auto").strip().lower(),
         openai_api_key=os.getenv("OPENAI_API_KEY") or None,
         abacus_api_key=os.getenv("ABACUS_API_KEY") or None,
         abacus_base_url=os.getenv(
@@ -61,6 +66,15 @@ def get_settings() -> Settings:
         ).rstrip("/"),
         model_name=os.getenv("MODEL_NAME", "gpt-5-mini"),
         reasoning_effort=os.getenv("OPENAI_REASONING_EFFORT", "low"),
+        codex_model_name=os.getenv("CODEX_MODEL", "gpt-5.6-terra").strip(),
+        codex_reasoning_effort=os.getenv("CODEX_REASONING_EFFORT", "low").strip(),
+        codex_timeout_seconds=int(os.getenv("CODEX_TIMEOUT_SECONDS", "240")),
+        codex_work_dir=Path(os.getenv("CODEX_WORK_DIR", "/tmp/cv-codex-work")),
+        auto_provider_order=tuple(
+            provider
+            for provider in _csv(os.getenv("AUTO_PROVIDER_ORDER", "codex,abacus"))
+            if provider in {"codex", "abacus"}
+        ),
         max_compile_retries=int(os.getenv("MAX_COMPILE_RETRIES", "4")),
         max_generator_retries=int(os.getenv("MAX_GENERATOR_RETRIES", "2")),
         max_scorer_retries=int(os.getenv("MAX_SCORER_RETRIES", "2")),

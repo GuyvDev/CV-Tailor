@@ -18,6 +18,7 @@ class GenerateRequest(BaseModel):
     source_job_id: str = ""
     edit_instructions: str | None = None
     approved_draft: ResumeDraft | None = None
+    provider: Literal["auto", "codex", "abacus", "openai"] | None = None
 
 
 class GenerateResponse(BaseModel):
@@ -51,6 +52,7 @@ class JobMetadata(BaseModel):
 
 class CompileRequest(BaseModel):
     typst_source: str
+    assets_base64: dict[str, str] = Field(default_factory=dict)
 
 
 class CompileResponse(BaseModel):
@@ -79,6 +81,27 @@ class ScoreResumeResponse(BaseModel):
     source_job_id: str
     used_original_job_description: bool
     report: ResumeScoreReport
+
+
+class CoverLetterRequest(BaseModel):
+    source_job_id: str = Field(min_length=1)
+    instructions: str = Field(default="", max_length=2000)
+
+
+class CoverLetterEditRequest(BaseModel):
+    source_job_id: str = Field(min_length=1)
+    instructions: str = Field(min_length=1, max_length=2000)
+
+
+class CoverLetterResponse(BaseModel):
+    source_job_id: str
+    filename: str
+    content: str
+    pdf_base64: str
+    page_count: int
+    one_page_verified: bool
+    non_overlap_verified: bool
+    body_font_size: float
 
 
 class ProfileSummary(BaseModel):
@@ -137,7 +160,7 @@ class SaveProfileBundleRequest(BaseModel):
 
 
 class AppSettingsResponse(BaseModel):
-    llm_provider: str = "openai"
+    llm_provider: str = "auto"
     model_name: str = "gpt-5-mini"
     reasoning_effort: str = "low"
     abacus_base_url: str = "https://routellm.abacus.ai/v1"
@@ -145,10 +168,12 @@ class AppSettingsResponse(BaseModel):
     enable_demo_mode: bool = True
     openai_api_key_configured: bool = False
     abacus_api_key_configured: bool = False
+    codex_installed: bool = False
+    codex_authenticated: bool = False
 
 
 class SaveAppSettingsRequest(BaseModel):
-    llm_provider: str = "openai"
+    llm_provider: str = "auto"
     model_name: str = "gpt-5-mini"
     reasoning_effort: str = "low"
     abacus_base_url: str = "https://routellm.abacus.ai/v1"

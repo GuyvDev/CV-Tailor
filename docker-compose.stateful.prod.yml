@@ -32,6 +32,7 @@ services:
 
   frontend:
     <<: *runtime_defaults
+    image: cv-docker-frontend-stateful-prod
     build:
       context: ./frontend
       args:
@@ -45,15 +46,17 @@ services:
 
   api:
     <<: [*runtime_defaults, *dns_defaults]
+    image: cv-docker-api-stateful-prod
     build:
       context: ./api
+      target: stateful
     environment:
       APP_ENV: production
       REQUIRE_API_AUTH: "false"
       API_ENABLE_DOCS: "false"
       API_PUBLIC_FILES_ENABLED: "true"
       API_ALLOWED_ORIGINS: ""
-      LLM_PROVIDER: ${LLM_PROVIDER:-openai}
+      LLM_PROVIDER: ${LLM_PROVIDER:-auto}
       PROFILE_DIR: /app/data/profile
       OUTPUT_DIR: /app/outputs
       COMPILER_URL: http://typst-compiler:8001
@@ -67,9 +70,15 @@ services:
       MODEL_NAME: ${MODEL_NAME:-gpt-5-mini}
       OPENAI_REASONING_EFFORT: ${OPENAI_REASONING_EFFORT:-low}
       ENABLE_DEMO_MODE: ${ENABLE_DEMO_MODE:-false}
+      CODEX_HOME: /app/.codex
+      CODEX_MODEL: ${CODEX_MODEL:-gpt-5.6-terra}
+      CODEX_REASONING_EFFORT: ${CODEX_REASONING_EFFORT:-low}
+      CODEX_TIMEOUT_SECONDS: ${CODEX_TIMEOUT_SECONDS:-240}
+      AUTO_PROVIDER_ORDER: ${AUTO_PROVIDER_ORDER:-codex,abacus}
     volumes:
       - ${STATEFUL_DATA_DIR:-./data.prod}:/app/data
       - ${STATEFUL_OUTPUT_DIR:-./outputs.prod}:/app/outputs
+      - codex_auth:/app/.codex
     healthcheck:
       test:
         [
@@ -131,3 +140,4 @@ networks:
 volumes:
   caddy_data:
   caddy_config:
+  codex_auth:
