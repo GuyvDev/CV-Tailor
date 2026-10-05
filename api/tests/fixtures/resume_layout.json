@@ -1,0 +1,106 @@
+{
+  "contact": {
+    "name": "Example Candidate",
+    "email": "candidate@example.com",
+    "location": "Example City",
+    "linkedin": "",
+    "github": ""
+  },
+  "headline": "",
+  "profile": "Electrical engineering student with practical experience building and debugging digital systems, Linux kernel components, and accelerated computing pipelines. Developed and validated timing-sensitive interfaces and concurrent workflows using verified project evidence.",
+  "education": {
+    "school": "Example Institute of Technology",
+    "degree": "B.Sc. in Electrical Engineering",
+    "dates": "2021 - Present",
+    "bullets": [
+      "Honors: Academic distinction.",
+      "Relevant coursework: Digital Systems Design, Computer Architecture, Operating Systems, Accelerated Systems, Data Structures and Algorithms, and Computer Vision."
+    ]
+  },
+  "projects": [
+    {
+      "title": "Digital System Implementation",
+      "stack": [
+        "C++",
+        "Linux"
+      ],
+      "dates": "2024",
+      "bullets": [
+        "Designed and implemented a modular system with timing-sensitive interfaces, bounded packet handling, and an integrated debugging workflow.",
+        "Built and validated concurrent components using synchronization primitives, shared memory, and coordinated producer-consumer execution.",
+        "Investigated integration failures and verified system behavior through repeatable debugging, synthesis iteration, and memory-management analysis."
+      ]
+    },
+    {
+      "title": "Operating Systems Laboratory",
+      "stack": [
+        "C++",
+        "Linux"
+      ],
+      "dates": "2024",
+      "bullets": [
+        "Designed and implemented a modular system with timing-sensitive interfaces, bounded packet handling, and an integrated debugging workflow.",
+        "Built and validated concurrent components using synchronization primitives, shared memory, and coordinated producer-consumer execution.",
+        "Investigated integration failures and verified system behavior through repeatable debugging, synthesis iteration, and memory-management analysis."
+      ]
+    },
+    {
+      "title": "Accelerated Image Processing",
+      "stack": [
+        "C++",
+        "Linux"
+      ],
+      "dates": "2024",
+      "bullets": [
+        "Designed and implemented a modular system with timing-sensitive interfaces, bounded packet handling, and an integrated debugging workflow.",
+        "Built and validated concurrent components using synchronization primitives, shared memory, and coordinated producer-consumer execution.",
+        "Investigated integration failures and verified system behavior through repeatable debugging, synthesis iteration, and memory-management analysis."
+      ]
+    }
+  ],
+  "skills": [
+    {
+      "category": "Programming",
+      "items": [
+        "Python",
+        "C++",
+        "C",
+        "Verilog",
+        "Bash"
+      ]
+    },
+    {
+      "category": "Hardware",
+      "items": [
+        "FPGA",
+        "Digital design",
+        "Finite state machines",
+        "Synthesis",
+        "Debugging"
+      ]
+    },
+    {
+      "category": "Systems",
+      "items": [
+        "Linux",
+        "Kernel programming",
+        "System calls",
+        "Character device drivers",
+        "Concurrency",
+        "Synchronization"
+      ]
+    },
+    {
+      "category": "Computing",
+      "items": [
+        "CUDA",
+        "CUDA Streams",
+        "GPU programming",
+        "Shared memory"
+      ]
+    }
+  ],
+  "fit_summary": "Verified engineering evidence.",
+  "keywords": [],
+  "job_title": ""
+}

@@ -130,7 +130,7 @@ class PersonalizationOptions(BaseModel):
     forbidden_content_recommendation: str = ""
     fixed_education_typst: str = ""
     contact_header_typst: str = ""
-    layout_density: str = "compact"
+    layout_density: str = "comfortable"
     default_profile_text: str = ""
     extra_prompt_notes: str = ""
 
@@ -165,6 +165,7 @@ class AppSettingsResponse(BaseModel):
     reasoning_effort: str = "low"
     abacus_base_url: str = "https://routellm.abacus.ai/v1"
     output_basename: str = "tailored-resume"
+    append_company_to_output_name: bool = False
     enable_demo_mode: bool = True
     openai_api_key_configured: bool = False
     abacus_api_key_configured: bool = False
@@ -178,6 +179,7 @@ class SaveAppSettingsRequest(BaseModel):
     reasoning_effort: str = "low"
     abacus_base_url: str = "https://routellm.abacus.ai/v1"
     output_basename: str = "tailored-resume"
+    append_company_to_output_name: bool = False
     enable_demo_mode: bool = True
     openai_api_key: str = ""
     abacus_api_key: str = ""

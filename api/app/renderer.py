@@ -4,6 +4,7 @@ import re
 
 from app.data_loader import PersonalizationSettings, empty_personalization
 from app.resume_schema import ProjectEntry, ResumeDraft, SkillBucket
+from app.resume_layout import default_resume_template
 
 INLINE_COMMANDS = {
     "#strong[": "strong",
@@ -114,8 +115,7 @@ def render_contact_header(resume: ResumeDraft, personalization: PersonalizationS
     if links:
         lines.append('  ' + ' #text[ | ] '.join(links))
     lines.extend([
-        '  #v(-4pt)',
-        '  #line(length: 100%, stroke: 0.5pt + gray)',
+        '  #block(above: 3pt, below: 0pt)[#line(length: 100%, stroke: 0.5pt + gray)]',
         ']',
     ])
     return "\n".join(lines)
@@ -207,19 +207,28 @@ def layout_gap(personalization: PersonalizationSettings) -> str:
 
 def apply_layout_density(source: str, personalization: PersonalizationSettings) -> str:
     density = personalization.layout_density.strip().lower()
+    if "{{LAYOUT_DENSITY}}" in source:
+        # The default template owns its spacing. Keep preset names literal and
+        # let its blocks collapse adjacent gaps without extra vertical spacers.
+        if density not in {"compact", "comfortable", "spacious"}:
+            density = "compact"
+        return source.replace("{{LAYOUT_DENSITY}}", density)
     if density in {"compact", "comfortable"}:
         return source.replace("#v(1fr)", layout_gap(personalization))
     return source
 
 
-def render_resume(template: str, resume: ResumeDraft, personalization: PersonalizationSettings | None = None) -> str:
+def render_resume(template: str | None, resume: ResumeDraft, personalization: PersonalizationSettings | None = None) -> str:
+    template = default_resume_template() if template is None else template
     personalization = personalization or empty_personalization()
+    managed_spacing = "{{LAYOUT_DENSITY}}" in template
 
     # ── profile ───────────────────────────────────────────────────────────────
+    profile_text = render_inline_markup(normalize_profile_markup(strip_generated_semester_averages(resume.profile, personalization), personalization))
     profile_section = (
         f'#section("Profile")\n'
-        f'{render_inline_markup(normalize_profile_markup(strip_generated_semester_averages(resume.profile, personalization), personalization))}'
-    )
+        f'{profile_text}'
+    ) if profile_text else ""
 
     # ── education ─────────────────────────────────────────────────────────────
     if personalization.fixed_education_typst:
@@ -239,21 +248,30 @@ def render_resume(template: str, resume: ResumeDraft, personalization: Personali
         cleaned = strip_generated_semester_averages(b, personalization)
         if cleaned:
             edu_lines.append(f"#bullet[{render_inline_markup(cleaned)}]")
-    education_section = '#section("Education")\n' + "\n".join(edu_lines)
+    education_section = '#section("Education")\n' + "\n".join(edu_lines) if any(line.strip() for line in edu_lines) else ""
 
     # ── projects ──────────────────────────────────────────────────────────────
-    project_blocks = "\n#v(0.45em)\n".join(render_project(p, personalization) for p in resume.projects)
-    projects_section = f'#section("Projects")\n{project_blocks}'
+    rendered_projects = [render_project(p, personalization) for p in resume.projects]
+    rendered_projects = [project for project in rendered_projects if "\n#bullet[" in project]
+    if managed_spacing and rendered_projects:
+        # The section supplies the first project's top gap. Subsequent project
+        # headings supply their own gap and stay with their first bullet.
+        rendered_projects[0] = rendered_projects[0].replace("#project[", "#project(first: true)[", 1)
+    project_separator = "\n\n" if managed_spacing else "\n#v(0.45em)\n"
+    project_blocks = project_separator.join(rendered_projects)
+    projects_section = f'#section("Projects")\n{project_blocks}' if project_blocks else ""
 
     # ── skills ────────────────────────────────────────────────────────────────
-    skills_section = f'#section("Skills")\n{render_skills(resume.skills, personalization)}'
+    skills_content = render_skills(resume.skills, personalization)
+    skills_section = f'#section("Skills")\n{skills_content}' if skills_content else ""
 
     # ── assemble remaining body sections ──────────────────────────────────────
-    body_content = "\n\n#v(1fr)\n\n".join([
+    section_separator = "\n\n" if managed_spacing else "\n\n#v(1fr)\n\n"
+    body_content = section_separator.join(section for section in [
         education_section,
         projects_section,
         skills_section,
-    ])
+    ] if section)
 
     rendered = (
         template

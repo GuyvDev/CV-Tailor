@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "build": "vite build",
+    "test:resume-layout": "node --test scripts/test-resume-layout.mjs",
     "dev": "vite --host 0.0.0.0 --port 3000"
   },
   "dependencies": {

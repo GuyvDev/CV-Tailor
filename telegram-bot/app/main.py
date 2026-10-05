@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import difflib
+import html
 import json
 import logging
 import os
@@ -90,6 +91,8 @@ INVALID_SCRAPE_MARKERS = (
     "getlocationname(",
 )
 COMEET_HOSTS = {"comeet.com", "www.comeet.com", "comeet.co", "www.comeet.co"}
+SECRETHUNTER_HOSTS = {"secrethunter.io", "www.secrethunter.io"}
+SECRETHUNTER_CRAWLER_HEADERS = {**SCRAPE_HEADERS, "User-Agent": "Googlebot"}
 
 STAGE_LABELS: dict[str, str] = {
     "queued": "Queued...",
@@ -256,6 +259,8 @@ async def scrape_job_description(url: str) -> str:
     async with httpx.AsyncClient(
         headers=SCRAPE_HEADERS, follow_redirects=True, timeout=30
     ) as client:
+        if _is_secrethunter_job_url(url):
+            return await _scrape_secrethunter_job(client, url)
         resp = await client.get(url)
         resp.raise_for_status()
     final_url = str(resp.url)
@@ -306,6 +311,53 @@ async def scrape_job_description(url: str) -> str:
 def _is_comeet_url(url: str) -> bool:
     host = urlparse(url).netloc.lower()
     return host in COMEET_HOSTS
+
+
+def _is_secrethunter_job_url(url: str) -> bool:
+    parsed = urlparse(url)
+    return parsed.hostname in SECRETHUNTER_HOSTS and bool(
+        re.fullmatch(r"/(?:jobz|jobs)/[A-Za-z0-9_-]+(?:/[A-Za-z0-9_-]+)?/?", parsed.path)
+    )
+
+
+def _secrethunter_jobposting(html_text: str) -> dict | None:
+    soup = BeautifulSoup(html_text, "lxml")
+    for node in soup.select('script[type="application/ld+json"]'):
+        try:
+            value = json.loads(node.string or node.get_text())
+        except (TypeError, json.JSONDecodeError):
+            continue
+        entries = value if isinstance(value, list) else [value]
+        for entry in entries:
+            if isinstance(entry, dict) and entry.get("@type") == "JobPosting":
+                return entry
+    return None
+
+
+async def _scrape_secrethunter_job(client: httpx.AsyncClient, url: str) -> str:
+    response = await client.get(url, headers=SECRETHUNTER_CRAWLER_HEADERS)
+    response.raise_for_status()
+    posting = _secrethunter_jobposting(response.text)
+    if posting is None:
+        soup = BeautifulSoup(response.text, "lxml")
+        canonical = soup.select_one('link[rel="canonical"]')
+        target = str(canonical.get("href") or "") if canonical else ""
+        if not _is_secrethunter_job_url(target) or "/jobs/" not in urlparse(target).path:
+            raise ValueError("SecretHunter did not provide the job posting for this link.")
+        response = await client.get(target, headers=SECRETHUNTER_CRAWLER_HEADERS)
+        response.raise_for_status()
+        posting = _secrethunter_jobposting(response.text)
+    if posting is None:
+        raise ValueError("SecretHunter did not provide the job posting for this link.")
+
+    organization = posting.get("hiringOrganization")
+    company = organization.get("name") if isinstance(organization, dict) else ""
+    title = posting.get("title")
+    description = posting.get("description")
+    description_text = _clean(BeautifulSoup(html.unescape(str(description or "")), "lxml").get_text("\n", strip=True))
+    if not company or not title or not _is_usable_job_description(description_text):
+        raise ValueError("SecretHunter returned an incomplete job posting.")
+    return _clean(f"Company: {company}\nJob title: {title}\n\n{description_text}")
 
 
 def _json_variable(html_text: str, variable_name: str) -> object | None:
@@ -568,6 +620,36 @@ async def request_provider_usage() -> dict:
         raise RuntimeError(_format_network_error("api", exc)) from exc
 
 
+async def request_app_settings() -> dict:
+    try:
+        async with httpx.AsyncClient(timeout=30, headers=api_headers()) as client:
+            resp = await client.get(f"{API_URL}/api/app-settings")
+            resp.raise_for_status()
+            return resp.json()
+    except httpx.HTTPError as exc:
+        raise RuntimeError(_format_network_error("api", exc)) from exc
+
+
+async def set_company_filename_enabled(enabled: bool) -> dict:
+    settings = await request_app_settings()
+    payload = {
+        "llm_provider": settings.get("llm_provider", "auto"),
+        "model_name": settings.get("model_name", "gpt-5-mini"),
+        "reasoning_effort": settings.get("reasoning_effort", "low"),
+        "abacus_base_url": settings.get("abacus_base_url", "https://routellm.abacus.ai/v1"),
+        "output_basename": settings.get("output_basename", "tailored-resume"),
+        "append_company_to_output_name": enabled,
+        "enable_demo_mode": bool(settings.get("enable_demo_mode", True)),
+    }
+    try:
+        async with httpx.AsyncClient(timeout=30, headers=api_headers()) as client:
+            resp = await client.post(f"{API_URL}/api/app-settings", json=payload)
+            resp.raise_for_status()
+            return resp.json()
+    except httpx.HTTPError as exc:
+        raise RuntimeError(_format_network_error("api", exc)) from exc
+
+
 async def _safe_edit(
     msg: Message,
     text: str,
@@ -635,6 +717,15 @@ async def download_pdf(pdf_url: str) -> bytes:
 
 async def download_typst(typst_url: str) -> bytes:
     return await download_artifact(typst_url)
+
+
+def artifact_filename(metadata: dict, artifact: str) -> str:
+    """Use the API-selected filename, with the legacy configured name as a fallback."""
+    url = str(metadata.get(f"{artifact}_url") or "")
+    name = url.rsplit("/", 1)[-1]
+    if name and "." in name:
+        return name
+    return OUTPUT_PDF_FILENAME if artifact == "pdf" else OUTPUT_TYPST_FILENAME
 
 
 async def fetch_cv_list() -> list[dict]:
@@ -1200,14 +1291,14 @@ async def run_approved_edit(
         caption = "\n\n".join(caption_parts)[:1024]
         await reply_message.reply_document(
             document=pdf_bytes,
-            filename=OUTPUT_PDF_FILENAME,
+            filename=artifact_filename(metadata, "pdf"),
             caption=caption,
             parse_mode="Markdown",
         )
         if typ_bytes is not None:
             await reply_message.reply_document(
                 document=typ_bytes,
-                filename=OUTPUT_TYPST_FILENAME,
+                filename=artifact_filename(metadata, "typst"),
             )
         score_text = _score_findings_text(metadata)
         if score_text:
@@ -1406,6 +1497,33 @@ async def cmd_provider(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     )
 
 
+async def cmd_name_cv(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_allowed(update):
+        return
+    requested = (context.args[0].lower() if context.args else "").strip()
+    if requested and requested not in {"on", "off"}:
+        await update.message.reply_text("Usage: `/name_cv` to toggle, or `/name_cv on` / `/name_cv off`.", parse_mode="Markdown")
+        return
+    try:
+        settings = await request_app_settings()
+        current = bool(settings.get("append_company_to_output_name", False))
+        enabled = requested == "on" if requested else not current
+        await set_company_filename_enabled(enabled)
+    except Exception as exc:
+        await update.message.reply_text(f"Could not update CV filename setting: {exc}")
+        return
+    if enabled:
+        await update.message.reply_text(
+            f"Company suffix is on. New files will use names such as {settings.get('output_basename') or OUTPUT_BASENAME}-Apple.pdf "
+            f"or {settings.get('output_basename') or OUTPUT_BASENAME}-Amazon.pdf when the employer is identified from the posting or its source URL. "
+            "The company suffix uses at most two words. Job-board names such as Comeet are ignored.",
+        )
+    else:
+        await update.message.reply_text(
+            f"Company suffix is off. New files will use the base name: {settings.get('output_basename') or OUTPUT_BASENAME}.pdf.",
+        )
+
+
 def _format_reset(timestamp: object) -> str:
     try:
         return datetime.fromtimestamp(int(timestamp), tz=UTC).strftime("%Y-%m-%d %H:%M UTC")
@@ -1473,40 +1591,31 @@ async def cmd_usage(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     except Exception as exc:
         await status.edit_text(f"Could not read provider usage: {exc}")
 
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+
+def command_help_text() -> str:
+    commands = "\n\n".join(f"/{name} — {description}" for name, _handler, description in BOT_COMMANDS)
+    return (
+        "CV Docker Bot\n\n"
+        + commands
+        + "\n\nGenerate a CV:\n"
+        "Send one or more job posting URLs, one per line. Optional role prefixes: "
+        "ai:, systems:, software:, architecture:.\n"
+        "Or start a pasted job description with #cv. Optional hints: #cv systems or role: systems.\n"
+        "Or upload a .txt or .md job description. Add notes or a role hint in the caption.\n\n"
+        "Use a saved job's ID or label where supported. /edit previews changes for approval before compiling."
+    )
+
+
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_allowed(update):
         return
-    await update.message.reply_text(
-        "*CV Docker Bot*\n\n"
-        "*Generate:* Send one or more job posting URLs (one per line).\n"
-        "`/provider` — choose Auto, Codex, or Abacus for new jobs\n"
-        "`/usage` — show Codex limits and observed Abacus usage\n"
-        "Optional role prefix: `ai:`, `systems:`, `software:`, `architecture:`\n\n"
-        "*Generate from tagged text message:* Start the message with `#cv`\n"
-        "Optional first line or second line role hint: `#cv systems` or `role: systems`\n\n"
-        "*Generate from text file:* Upload a `.txt` or `.md` file with the job description, your notes, and your requests.\n"
-        "Optional caption: `systems`, `role: systems`, or any free-text notes/requests to append to the uploaded brief.\n\n"
-        "*Edit a previous CV:*\n"
-        "`/edit` — pick from ID list, preview diff, then approve\n"
-        "`/edit <id> <instructions>` — direct preview\n\n"
-        "*Score an existing CV without regenerating it:*\n"
-        "`/score <id>` — score against the original job description\n"
-        "`/score <id> <url>` — score against a freshly scraped job description from that URL\n"
-        "Reply to a new job description text or `.txt` / `.md` file with `/score <id>` — score against the new description\n\n"
-        "*Create a cover letter for a completed job:*\n"
-        "`/coverletter` — pick the specific job from a list\n"
-        "`/coverletter <id-or-label> [instructions]` — generate directly\n\n"
-        "*Edit a generated cover letter:*\n"
-        "`/editcoverletter` — pick a cover letter, then send instructions\n"
-        "`/editcoverletter <id-or-label> <instructions>` — edit directly\n\n"
-        "*Stop active jobs:*\n"
-        "`/stop` — multi-select from active jobs\n"
-        "`/stop <id>` — direct\n\n"
-        "*Remove a CV:*\n"
-        "`/remove` — multi-select from saved CVs\n"
-        "`/remove <id>` — direct",
-        parse_mode="Markdown",
-    )
+    # Plain text keeps underscores in command names literal and cannot fail
+    # Telegram's Markdown parser as commands and usage examples change.
+    await update.effective_message.reply_text(command_help_text())
+
+
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await cmd_help(update, context)
 
 
 async def send_cover_letter(
@@ -2196,14 +2305,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             caption = "\n\n".join(caption_parts)[:1024]
             await update.message.reply_document(
                 document=pdf_bytes,
-                filename=OUTPUT_PDF_FILENAME,
+                filename=artifact_filename(metadata, "pdf"),
                 caption=caption,
                 parse_mode="Markdown",
             )
             if typ_bytes is not None:
                 await update.message.reply_document(
                     document=typ_bytes,
-                    filename=OUTPUT_TYPST_FILENAME,
+                    filename=artifact_filename(metadata, "typst"),
                 )
             score_text = _score_findings_text(metadata)
             if score_text:
@@ -2266,14 +2375,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             caption = "\n\n".join(caption_parts)[:1024]
             await update.message.reply_document(
                 document=pdf_bytes,
-                filename=OUTPUT_PDF_FILENAME,
+                filename=artifact_filename(metadata, "pdf"),
                 caption=caption,
                 parse_mode="Markdown",
             )
             if typ_bytes is not None:
                 await update.message.reply_document(
                     document=typ_bytes,
-                    filename=OUTPUT_TYPST_FILENAME,
+                    filename=artifact_filename(metadata, "typst"),
                 )
             score_text = _score_findings_text(metadata)
             if score_text:
@@ -2332,14 +2441,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             caption = "\n\n".join(caption_parts)[:1024]
             await update.message.reply_document(
                 document=pdf_bytes,
-                filename=OUTPUT_PDF_FILENAME,
+                filename=artifact_filename(metadata, "pdf"),
                 caption=caption,
                 parse_mode="Markdown",
             )
             if typ_bytes is not None:
                 await update.message.reply_document(
                     document=typ_bytes,
-                    filename=OUTPUT_TYPST_FILENAME,
+                    filename=artifact_filename(metadata, "typst"),
                 )
             score_text = _score_findings_text(metadata)
             if score_text:
@@ -2357,20 +2466,34 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 # ── entry point ───────────────────────────────────────────────────────────────
 
-def main() -> None:
+# A single registry keeps /help and registered command handlers synchronized.
+BOT_COMMANDS = (
+    ("start", cmd_start, "Show the welcome message, all commands, and ways to generate a CV."),
+    ("help", cmd_help, "Show every supported command and what it does."),
+    ("provider", cmd_provider, "Choose the provider for new jobs. Use /provider auto, codex, or abacus; no argument shows buttons."),
+    ("name_cv", cmd_name_cv, "Toggle employer names in new CV filenames. Use /name_cv on or /name_cv off to set it explicitly."),
+    ("usage", cmd_usage, "Show Codex limits and locally observed Abacus usage."),
+    ("score", cmd_score, "Score a saved CV without regenerating it: /score <id> [job-url]. Or reply to new job-description text or a .txt/.md file with /score <id>."),
+    ("coverletter", cmd_coverletter, "Generate a cover letter for a saved CV. Pick a job, or use /coverletter <id-or-label> [instructions]."),
+    ("editcoverletter", cmd_editcoverletter, "Edit a saved cover letter. Pick one, or use /editcoverletter <id-or-label> <instructions>."),
+    ("edit", cmd_edit, "Edit a saved CV with a diff preview and approval. Pick a CV, or use /edit <id> <instructions>."),
+    ("stop", cmd_stop, "Stop queued or running jobs. Choose jobs from the list, or use /stop <id>."),
+    ("remove", cmd_remove, "Remove saved CVs and their artifacts. Choose jobs from the list, or use /remove <id>."),
+)
+
+
+def build_application() -> Application:
     app = Application.builder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("provider", cmd_provider))
-    app.add_handler(CommandHandler("usage", cmd_usage))
-    app.add_handler(CommandHandler("score", cmd_score))
-    app.add_handler(CommandHandler("coverletter", cmd_coverletter))
-    app.add_handler(CommandHandler("editcoverletter", cmd_editcoverletter))
-    app.add_handler(CommandHandler("edit", cmd_edit))
-    app.add_handler(CommandHandler("stop", cmd_stop))
-    app.add_handler(CommandHandler("remove", cmd_remove))
+    for name, handler, _description in BOT_COMMANDS:
+        app.add_handler(CommandHandler(name, handler))
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.Document.ALL & ~filters.COMMAND, handle_message))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    return app
+
+
+def main() -> None:
+    app = build_application()
     logger.info("Bot started with API_URL=%s", API_URL)
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 

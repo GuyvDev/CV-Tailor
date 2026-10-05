@@ -64,6 +64,8 @@ from app.models import (
 from app.review_schema import ResumeScoreReport
 from app.renderer import render_resume
 from app.resume_schema import ResumeDraft
+from app.resume_layout import default_resume_template
+from app.output_naming import infer_output_company, short_output_company
 from app.services.compiler_client import CompilerClient
 from app.services.job_store import JobStore
 from app.services.openai_service import ResumeGenerator
@@ -229,6 +231,7 @@ def _read_app_settings_secret() -> dict[str, object]:
         "reasoning_effort": settings.reasoning_effort,
         "abacus_base_url": settings.abacus_base_url,
         "output_basename": os.getenv("OUTPUT_BASENAME", "tailored-resume"),
+        "append_company_to_output_name": False,
         "enable_demo_mode": settings.enable_demo_mode,
         "openai_api_key": settings.openai_api_key or "",
         "abacus_api_key": settings.abacus_api_key or "",
@@ -248,6 +251,7 @@ def _app_settings_response() -> AppSettingsResponse:
         reasoning_effort=str(data.get("reasoning_effort") or "low"),
         abacus_base_url=str(data.get("abacus_base_url") or "https://routellm.abacus.ai/v1"),
         output_basename=str(data.get("output_basename") or "tailored-resume"),
+        append_company_to_output_name=bool(data.get("append_company_to_output_name", False)),
         enable_demo_mode=bool(data.get("enable_demo_mode", True)),
         openai_api_key_configured=bool(str(data.get("openai_api_key") or "").strip()),
         abacus_api_key_configured=bool(str(data.get("abacus_api_key") or "").strip()),
@@ -265,6 +269,7 @@ def _write_app_settings(payload: SaveAppSettingsRequest) -> AppSettingsResponse:
         "reasoning_effort": payload.reasoning_effort.strip() or "low",
         "abacus_base_url": payload.abacus_base_url.strip().rstrip("/") or "https://routellm.abacus.ai/v1",
         "output_basename": payload.output_basename.strip() or "tailored-resume",
+        "append_company_to_output_name": payload.append_company_to_output_name,
         "enable_demo_mode": payload.enable_demo_mode,
         "openai_api_key": payload.openai_api_key.strip() or str(current.get("openai_api_key") or ""),
         "abacus_api_key": payload.abacus_api_key.strip() or str(current.get("abacus_api_key") or ""),
@@ -345,18 +350,27 @@ def _output_basename() -> str:
     return _safe_part(str(_read_app_settings_secret().get("output_basename") or "tailored-resume"), max_len=80)
 
 
+def _company_name_for_output(job_description: str, source_url: str = "") -> str:
+    company = short_output_company(infer_output_company(job_description, source_url))
+    return _safe_part(company, max_len=40) if company else ""
+
+
+def _output_basename_for_job(job_description: str, source_url: str = "") -> str:
+    base = _output_basename()
+    settings_data = _read_app_settings_secret()
+    if not bool(settings_data.get("append_company_to_output_name", False)):
+        return base
+    company = _company_name_for_output(job_description, source_url)
+    return f"{base}-{company}" if company else base
+
+
 def _default_stateless_template() -> str:
-    return '#set page(\n  paper: "us-letter",\n  margin: (x: 2.54cm, y: 2.00cm),\n)\n\n#set text(font: "DejaVu Sans", size: 10pt, fill: black)\n#set par(leading: 0.5em, justify: true, spacing: 0pt)\n#set block(spacing: 6pt)\n\n#let theme-blue = rgb("#00508C")\n\n#let section(title) = {\n  stack(\n    dir: ttb,\n    spacing: 1pt,\n    text(fill: theme-blue, weight: "bold", size: 11pt)[#upper(title)],\n    line(length: 100%, stroke: 0.5pt + theme-blue),\n  )\n  v(4pt)\n}\n\n#let project(title) = {\n  v(4pt)\n  text(fill: theme-blue, weight: "bold")[#title]\n}\n\n#let bullet(content) = {\n  grid(\n    columns: (12pt, 1fr),\n    gutter: 0pt,\n    align: (right, left),\n    [•#h(4pt)],\n    content\n  )\n}\n\n// Header\n{{CONTACT_HEADER}}\n\n#v(8pt)\n\n{{PROFILE_SECTION}}\n\n{{BODY_CONTENT}}\n'
+    return default_resume_template()
 
 
 def _stateless_template(payload: StatelessGenerateRequest) -> str:
     if payload.template_typst.strip():
         return payload.template_typst
-    template_path = settings.profile_dir.parent / "profile.example" / "templates" / "base_resume.typ"
-    if not template_path.exists():
-        template_path = Path(__file__).parents[2] / "data" / "profile.example" / "templates" / "base_resume.typ"
-    if template_path.exists():
-        return template_path.read_text(encoding="utf-8")
     return _default_stateless_template()
 
 
@@ -445,7 +459,7 @@ def _run_stateless_generation(payload: StatelessGenerateRequest) -> StatelessGen
         )
         last_draft = draft
         last_source = render_resume(profile.template, draft, profile.personalization)
-        compile_result = asyncio.run(compiler_client.compile(last_source))
+        last_source, compile_result = asyncio.run(compiler_client.compile_resume(last_source))
         compile_feedback = (
             f"success={compile_result.success}, "
             f"page_count={compile_result.page_count}, "
@@ -574,7 +588,7 @@ Return JSON with exactly this shape:
     "forbidden_content_recommendation": "",
     "fixed_education_typst": "",
     "contact_header_typst": "",
-    "layout_density": "compact",
+    "layout_density": "comfortable",
     "default_profile_text": "",
     "extra_prompt_notes": ""
   }}
@@ -1620,7 +1634,7 @@ async def _run_generation_job_once(
         nonlocal metadata
         if not last_pdf_bytes:
             raise RuntimeError("Missing compiled PDF bytes for approved draft.")
-        output_base = _output_basename()
+        output_base = _output_basename_for_job(payload.job_description, payload.source_url)
         job_store.write_text_artifact(job_id, "resume.typ", last_typst_source)
         job_store.write_binary_artifact(job_id, "resume.pdf", last_pdf_bytes)
         job_store.write_text_artifact(job_id, f"{output_base}.typ", last_typst_source)
@@ -1650,8 +1664,8 @@ async def _run_generation_job_once(
             stage="completed",
             page_count=1,
             compile_logs=compile_logs,
-            pdf_url=f"/files/{job_id}/{_output_basename()}.pdf",
-            typst_url=f"/files/{job_id}/{_output_basename()}.typ",
+            pdf_url=f"/files/{job_id}/{output_base}.pdf",
+            typst_url=f"/files/{job_id}/{output_base}.typ",
             fit_summary=draft.fit_summary,
             keywords=draft.keywords,
             extra={
@@ -1665,7 +1679,7 @@ async def _run_generation_job_once(
         nonlocal metadata
         if not last_pdf_bytes:
             raise RuntimeError("Missing compiled PDF bytes for final draft.")
-        output_base = _output_basename()
+        output_base = _output_basename_for_job(payload.job_description, payload.source_url)
         job_store.write_text_artifact(job_id, "resume.typ", last_typst_source)
         job_store.write_binary_artifact(job_id, "resume.pdf", last_pdf_bytes)
         job_store.write_text_artifact(job_id, f"{output_base}.typ", last_typst_source)
@@ -1696,8 +1710,8 @@ async def _run_generation_job_once(
             stage="completed",
             page_count=1,
             compile_logs=compile_logs,
-            pdf_url=f"/files/{job_id}/{_output_basename()}.pdf",
-            typst_url=f"/files/{job_id}/{_output_basename()}.typ",
+            pdf_url=f"/files/{job_id}/{output_base}.pdf",
+            typst_url=f"/files/{job_id}/{output_base}.typ",
             fit_summary=draft.fit_summary,
             review_summary=report.summary if report else None,
             quality_score=report.quality_score if report else None,
@@ -1726,7 +1740,7 @@ async def _run_generation_job_once(
             fit_summary=draft.fit_summary,
             error=None,
         )
-        compile_result = await compiler_client.compile(last_typst_source)
+        last_typst_source, compile_result = await compiler_client.compile_resume(last_typst_source)
         check_cancel()
         compile_logs.append(
             f"Attempt 1: success={compile_result.success}, "
@@ -1876,7 +1890,7 @@ async def _run_generation_job_once(
                 fit_summary=draft.fit_summary,
             )
 
-            compile_result = await compiler_client.compile(last_typst_source)
+            last_typst_source, compile_result = await compiler_client.compile_resume(last_typst_source)
             check_cancel()
             compile_feedback = (
                 f"success={compile_result.success}, "

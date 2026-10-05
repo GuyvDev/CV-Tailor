@@ -1,4 +1,4 @@
-import { NodeCompiler } from "@myriaddreamin/typst-ts-node-compiler";
+import { compileResume, renderResume, type Draft } from "./resume.js";
 
 type Project = {
   title: string;
@@ -6,37 +6,6 @@ type Project = {
   stack?: string[];
   cv_status?: string;
   facts?: string[];
-};
-
-type Draft = {
-  contact: {
-    name: string;
-    email?: string;
-    location?: string;
-    linkedin?: string;
-    github?: string;
-  };
-  headline?: string;
-  profile: string;
-  education: {
-    school?: string;
-    degree?: string;
-    dates?: string;
-    bullets?: string[];
-  };
-  projects: Array<{
-    title: string;
-    stack: string[];
-    dates?: string;
-    bullets: string[];
-  }>;
-  skills: Array<{
-    category: string;
-    items: string[];
-  }>;
-  fit_summary?: string;
-  keywords?: string[];
-  job_title?: string;
 };
 
 type ScoreReport = {
@@ -156,116 +125,6 @@ function validateInputSize(body: any): string | null {
 
 function safePart(value: string, maxLen = 80) {
   return (value || "tailored-resume").trim().replace(/[^\w-]/g, "_").slice(0, maxLen).replace(/^_+|_+$/g, "") || "tailored-resume";
-}
-
-function escapeTypst(value: string) {
-  return String(value || "")
-    .replace(/\\/g, "\\\\")
-    .replace(/#/g, "\\#")
-    .replace(/\[/g, "\\[")
-    .replace(/\]/g, "\\]")
-    .replace(/@/g, "\\@")
-    .replace(/</g, "\\<")
-    .replace(/>/g, "\\>")
-    .replace(/\*/g, "\\*")
-    .replace(/_/g, "\\_");
-}
-
-function renderInline(value: string) {
-  return escapeTypst(value || "");
-}
-
-function normalizeUrl(value?: string) {
-  if (!value) return "";
-  return value.startsWith("http") ? value : `https://${value}`;
-}
-
-function renderResume(draft: Draft) {
-  const contact = draft.contact || { name: "Candidate Name" };
-  const linkedinLabel = (contact.linkedin || "").replace(/^https?:\/\//, "");
-  const githubLabel = (contact.github || "").replace(/^https?:\/\//, "");
-  const links = [
-    contact.linkedin ? `#link("${escapeTypst(normalizeUrl(contact.linkedin))}")[#text(fill: theme-blue)[${escapeTypst(linkedinLabel)}]]` : "",
-    contact.github ? `#link("${escapeTypst(normalizeUrl(contact.github))}")[#text(fill: theme-blue)[${escapeTypst(githubLabel)}]]` : "",
-  ].filter(Boolean).join(" #text[ | ] ");
-  const details = [contact.location, contact.email].filter(Boolean).map((item) => escapeTypst(item || "")).join(" | ");
-  const header = [
-    "#align(center)[",
-    `  #text(fill: theme-blue, weight: "bold", size: 14pt)[${escapeTypst(contact.name || "Candidate Name")}]`,
-    details ? `  #text(fill: black)[ | ${details} |]` : "",
-    details ? "  #linebreak()" : "",
-    links ? `  ${links}` : "",
-    "  #v(-4pt)",
-    "  #line(length: 100%, stroke: 0.5pt + gray)",
-    "]",
-  ].filter(Boolean).join("\n");
-
-  const educationParts = [draft.education?.school, draft.education?.degree, draft.education?.dates ? `#emph[${escapeTypst(draft.education.dates)}]` : ""].filter(Boolean).join(" | ");
-  const educationBullets = (draft.education?.bullets || []).map((item) => `#bullet[${renderInline(item)}]`).join("\n");
-  const projectBlocks = (draft.projects || []).slice(0, 3).map((project) => {
-    const title = [project.title, ...(project.stack || []).slice(0, 2), project.dates || ""].filter(Boolean).join(" | ");
-    const bullets = (project.bullets || []).slice(0, 3).map((item) => `#bullet[${renderInline(item)}]`).join("\n");
-    return `#project[${escapeTypst(title)}]\n${bullets}`;
-  }).join("\n#v(0.45em)\n");
-  const skills = (draft.skills || []).slice(0, 4).map((bucket) => `#bullet[#strong[${escapeTypst(bucket.category)}:] ${(bucket.items || []).slice(0, 6).map(renderInline).join(", ")}]`).join("\n");
-
-  return `#set page(
-  paper: "us-letter",
-  margin: (x: 2.54cm, y: 2.00cm),
-)
-
-#set text(font: "DejaVu Sans", size: 10pt, fill: black)
-#set par(leading: 0.5em, justify: true, spacing: 0pt)
-#set block(spacing: 6pt)
-
-#let theme-blue = rgb("#00508C")
-
-#let section(title) = {
-  stack(
-    dir: ttb,
-    spacing: 1pt,
-    text(fill: theme-blue, weight: "bold", size: 11pt)[#upper(title)],
-    line(length: 100%, stroke: 0.5pt + theme-blue),
-  )
-  v(4pt)
-}
-
-#let project(title) = {
-  v(4pt)
-  text(fill: theme-blue, weight: "bold")[#title]
-}
-
-#let bullet(content) = {
-  grid(
-    columns: (12pt, 1fr),
-    gutter: 0pt,
-    align: (right, left),
-    [•#h(4pt)],
-    content
-  )
-}
-
-${header}
-
-#v(8pt)
-
-#section("Profile")
-${renderInline(draft.profile)}
-
-#section("Education")
-${educationParts}
-${educationBullets}
-
-#v(6pt)
-
-#section("Projects")
-${projectBlocks}
-
-#v(6pt)
-
-#section("Skills")
-${skills}
-`;
 }
 
 function extractContact(profileText: string) {
@@ -388,13 +247,6 @@ function safeScoreError(error: unknown) {
   return "Gemini scoring was temporarily unavailable for this run.";
 }
 
-async function compileTypst(source: string) {
-  const compiler = NodeCompiler.create();
-  const pdf = await compiler.pdf({ mainFileContent: source });
-  compiler.evictCache(10);
-  return Buffer.from(pdf);
-}
-
 export const config = {
   maxDuration: 300,
 };
@@ -421,8 +273,9 @@ export default async function handler(req: any, res: any) {
     } catch (error) {
       draft = fallbackDraft(body);
     }
-    const typstSource = renderResume(draft);
-    const pdfBuffer = await compileTypst(typstSource);
+    const typstSource = renderResume(draft, body.personalization?.layout_density);
+    const compiled = compileResume(typstSource);
+    const pdfBuffer = compiled.pdf;
     if (pdfBuffer.byteLength > MAX_OUTPUT_BYTES) return jsonResponse(res, 413, { detail: "Generated PDF is too large for Vercel response limits." });
 
     let scoreReport: ScoreReport | null = null;
@@ -435,13 +288,13 @@ export default async function handler(req: any, res: any) {
 
     return jsonResponse(res, 200, {
       pdf_base64: pdfBuffer.toString("base64"),
-      typst_source: typstSource,
-      page_count: 1,
+      typst_source: compiled.source,
+      page_count: compiled.pageCount,
       draft,
       score_report: scoreReport,
       score_error: scoreError,
       fit_summary: draft.fit_summary || null,
-      compile_logs: [],
+      compile_logs: compiled.logs,
       output_basename: safePart(body.output_basename || "tailored-resume"),
       model_name: process.env.STATELESS_MODEL_NAME || "gemini-2.5-flash",
     });

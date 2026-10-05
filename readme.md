@@ -153,6 +153,43 @@ Provider behavior:
 
 ## Cover letters and template customization
 
+Resume spacing is applied by deterministic rendering code and controlled by the Compact, Comfortable, and Spacious presets in
+the Personalize tab. The default template uses consistent spacing ratios above and below headings,
+keeps headings with their following content, and matches bullet spacing to the
+leading inside wrapped bullets. Typst measures the complete CV and proportionally
+expands the spacing to use available page height. Expansion is capped at 1.6 times
+the preset gaps so short CVs remain readable. Text size and margins stay fixed,
+and overflowing CVs retain their base spacing for the normal fitting process. New CVs
+start with Comfortable spacing; existing explicit density preferences are respected.
+When the requested preset exceeds one page, the API and serverless renderer try
+the tighter presets before requesting content edits. This changes only spacing:
+the text, font size, and margins stay the same. Normal bullets stay together;
+bullets taller than a page can flow across pages instead of clipping. Empty sections
+are omitted. If Compact still exceeds one page, the API's existing content-revision
+process handles it; the serverless endpoint reports the actual page count.
+
+The canonical default is `api/app/resume_template.typ`. After editing it, run
+`python scripts/sync_resume_layout.py` to generate the public example and the
+serverless template. CI checks that these stay synchronized and runs both the CLI
+and native Node compiler tests. Profiles without a private template automatically
+use the packaged default. The `{{LAYOUT_DENSITY}}` placeholder opts a template into
+managed spacing, including the smaller gap before the first project. Custom templates
+without that placeholder retain their existing spacing behavior.
+
+Use `#profile-note[#strong[Academic highlight]]` for each highlight below the
+Profile paragraph. The helper uses the same leading as the paragraph, so notes
+and wrapped note lines keep the same baseline spacing at every density.
+
+The layout follows Typst's guidance on [block spacing and sticky blocks](https://typst.app/docs/reference/layout/block/),
+[paragraph leading](https://typst.app/docs/reference/model/par/), and
+[fractional vertical spacing](https://typst.app/docs/reference/layout/v/).
+PDF geometry tests cover heading proximity, equal section gaps, profile highlights, wrapped bullets,
+bounded page-height expansion, preserved fonts and content,
+one-page fit, automatic spacing fallback, oversized bullets, and page-boundary behavior. Run them with Typst 0.13.1 available on
+`PATH` (or set `TYPST_BIN`) after installing `api/tests/requirements.txt`:
+`PYTHONPATH=api python -m unittest discover -s api/tests -v`.
+Run the serverless tests with `npm run test:resume-layout` in `frontend/`.
+
 Cover letters are generated from the active private profile, the saved job description, and the
 tailored CV. They reuse the provider recorded on the source CV. The API compiles exactly one page,
 measures the complete body before placing the signature, tries progressively tighter readable
@@ -316,6 +353,16 @@ docker compose up --build frontend api typst-compiler telegram-bot
 
 5. Open the web UI, choose the active profile, verify the output filename, and save settings.
 6. In Telegram, send or paste a job description using the commands shown by the bot. Generated PDFs are produced by the same API pipeline as the web UI.
+
+Use `/help` or `/start` to see every supported bot command, its meaning, and
+usage examples. The help text and command handlers share one registry.
+Use `/name_cv` to toggle employer names in new CV filenames, or `/name_cv on`
+and `/name_cv off` to set the preference explicitly. When enabled, the API
+uses explicit employer fields, official career URLs, or employer headings to
+choose the suffix. Apple and Amazon career links produce `<base>-Apple.pdf`
+and `<base>-Amazon.pdf`, with matching `.typ` filenames. Company suffixes contain
+at most two words, excluding a leading article such as “The”. Other employer domains
+are a fallback; generic job-board names such as Comeet are excluded.
 
 After a CV finishes, ask the bot for a cover letter tied to that saved job:
 

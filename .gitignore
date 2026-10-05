@@ -12,6 +12,7 @@ dist/
 docker-compose.override.yml
 data/profile/
 data/active_profile.txt
+data/provider_usage.json
 data/profiles/
 data/now/
 temp/

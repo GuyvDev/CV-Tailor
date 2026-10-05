@@ -5,6 +5,8 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
+from app.resume_layout import default_resume_template
+
 
 @dataclass(frozen=True)
 class StyleReference:
@@ -22,7 +24,7 @@ class PersonalizationSettings:
     forbidden_content_recommendation: str = ""
     fixed_education_typst: str = ""
     contact_header_typst: str = ""
-    layout_density: str = "compact"
+    layout_density: str = "comfortable"
     default_profile_text: str = ""
     extra_prompt_notes: str = ""
 
@@ -36,7 +38,7 @@ class PersonalizationSettings:
             forbidden_content_recommendation=str(data.get("forbidden_content_recommendation", "")),
             fixed_education_typst=str(data.get("fixed_education_typst", "")),
             contact_header_typst=str(data.get("contact_header_typst", "")),
-            layout_density=str(data.get("layout_density", "compact")),
+            layout_density=str(data.get("layout_density", "comfortable")),
             default_profile_text=str(data.get("default_profile_text", "")),
             extra_prompt_notes=str(data.get("extra_prompt_notes", "")),
         )
@@ -164,7 +166,11 @@ def load_profile_data(profile_dir: Path) -> ProfileData:
         skills=json.loads((profile_dir / "skills.json").read_text(encoding="utf-8")),
         rules=(profile_dir / "rules.md").read_text(encoding="utf-8"),
         cv_guidance=_load_cv_guidance(profile_dir),
-        template=(profile_dir / "templates" / "base_resume.typ").read_text(encoding="utf-8"),
+        template=(
+            (profile_dir / "templates" / "base_resume.typ").read_text(encoding="utf-8")
+            if (profile_dir / "templates" / "base_resume.typ").exists()
+            else default_resume_template()
+        ),
         examples=examples,
         style_references=_load_style_references(profile_dir),
         personalization=_load_personalization(profile_dir),

@@ -1,11 +1,17 @@
 from __future__ import annotations
 
 import json
+import re
 
 from app.data_loader import ProfileData
 from app.models import GenerateRequest
 from app.review_schema import ResumeScoreReport
 from app.resume_schema import ResumeDraft
+
+
+def _compiled_page_count(compile_feedback: str | None) -> int | None:
+    match = re.search(r"\bpage_count\s*=\s*(\d+)\b", compile_feedback or "", flags=re.IGNORECASE)
+    return int(match.group(1)) if match else None
 
 
 def _private_resume_constraints(profile: ProfileData) -> str:
@@ -71,7 +77,12 @@ Personalized profile constraints:
 - Keep the top third sharp: clear role target, concise profile, and strong first bullets.
 - Prefer bullets written as action + method/context + result.
 - Use strong action verbs and concrete engineering language.
-- Keep wording compact enough to fit a one-page PDF resume.
+- Use the available one-page space well: concise does not mean sparse. Prefer specific, supported
+  technical evidence over blank space, generic summaries, or prematurely deleting useful details.
+- Make the resume tell an end-to-end engineering story: what was built and why, how it was
+  implemented, and how it was tested, validated, used, or completed when the source supports it.
+- Keep wording compact enough to fit a one-page PDF resume, but compress only after an actual
+  multi-page compile result or clear repetition shows that compression is necessary.
 - Prefer stronger, differentiated projects first.
 - Avoid filler, cliches, keyword stuffing, vague self-praise, and unsupported claims.
 
@@ -88,10 +99,28 @@ def build_generator_user_prompt(
     scorer_feedback: ResumeScoreReport | None,
     compile_feedback: str | None = None,
 ) -> str:
-    retry_rules = {
-        1: "Produce the strongest first-pass one-page candidate draft with the highest role match.",
-        2: "Revise the previous draft using scorer and compile feedback. Tighten wording, improve ATS relevance, and compress only where needed.",
-    }
+    compiled_pages = _compiled_page_count(compile_feedback)
+    if attempt == 1:
+        attempt_policy = (
+            "Produce the strongest first-pass one-page candidate draft with the highest role match. "
+            "Use the page fully with substantive profile and project evidence."
+        )
+    elif compiled_pages == 1:
+        attempt_policy = (
+            "The previous draft already compiled to one page. Do not shorten it merely because this is a retry. "
+            "Use scorer feedback to enrich weak or sparse areas, preserve strong details, and improve relevance "
+            "while keeping the result on one page."
+        )
+    elif compiled_pages is not None and compiled_pages > 1:
+        attempt_policy = (
+            "The previous draft exceeded one page. Compress repetition and lower-value material while preserving "
+            "the strongest profile and end-to-end project evidence."
+        )
+    else:
+        attempt_policy = (
+            "Revise the previous draft using scorer feedback. Preserve its strong evidence; improve targeting and "
+            "content completeness without automatically making it shorter."
+        )
     examples = json.dumps(profile.examples, indent=2, ensure_ascii=False)
     style_references = "\n\n".join(
         [
@@ -135,7 +164,7 @@ def build_generator_user_prompt(
 Create a tailored resume draft for this job.
 
 Attempt number: {attempt}
-Attempt policy: {retry_rules.get(attempt, retry_rules[2])}
+Attempt policy: {attempt_policy}
 Role focus: {request.role_focus or "not specified"}
 Template: {request.template}{edit_block}
 
@@ -173,20 +202,30 @@ Latest compile feedback:
 
 Output requirements:
 - Use only information supported by the source material.
-- Keep the profile to at most 2 sentences.
+- Write a substantive profile of 2 compact sentences when the source supports it. Lead with the
+  candidate's role-relevant identity and strengths, then connect those strengths to specific technical
+  domains, tools, or project evidence. Avoid a thin one-line list of adjectives.
 - Set `headline` to an empty string unless a human explicitly asks for a separate profile headline.
 - Do not mention GPA unless a human explicitly asks for it or the job posting clearly requires GPA disclosure.
 - Do not mention the recent specialization-focused semester averages anywhere; the template hardcodes that line. This also means do not put those averages in `profile`, `education.bullets`, `fit_summary`, `keywords`, project bullets, or skills.
-- Default to 4 projects on the first attempt; reduce to 3 on the second attempt if it materially improves focus or page fit; never fewer than 2.
+- Default to 4 projects on the first attempt. Reduce to 3 only when an actual multi-page compile result
+  or clearly stronger role focus justifies it; never fewer than 2.
 - Project title must be the EXACT name from the project bank (do not paraphrase or abbreviate it).
 - If a project includes metadata such as `selection_priority: "support_only"` or a `selection_penalty`, treat it as last-rank supporting evidence and include it only when the target role clearly benefits from it after stronger core projects.
 - Project stack must contain at most 2 items — the two most relevant technologies for this role (they will be rendered as "Tech1 / Tech2").
 - education.bullets should contain compact role-relevant coursework or honors details that are supported by the profile. Do not duplicate details that the configured template already renders.
-- Keep project bullets crisp and interview-defensible.
+- Use 2-3 substantive bullets per selected project when the project bank supports them, normally totaling
+  at least 8 project bullets across the resume. Give the strongest projects 3 bullets and supporting
+  projects 2. Do not pad a project whose source contains fewer usable facts.
+- Across each project's bullets, cover the end-to-end story where supported: the problem or deliverable,
+  the concrete implementation (architecture, algorithms, tools, interfaces, or constraints), and the
+  result, verification, or practical use. Each bullet must add different evidence; do not restate one fact.
 - For the profile section, lean toward the tone and structure of the provided CV style references: concise, technical, specific, and grounded in systems/ML/accelerated-computing language when supported by the source material.
 - In the profile section, apply any configured personalized required phrase naturally inside a sentence; do not append it as a detached suffix.
 - For project descriptions, lean toward the provided CV style references: strong action verbs, explicit technical scope, and concrete engineering framing rather than generic task descriptions.
 - Keep keywords relevant to ATS language from the job description.
+- Keep 3-5 concise, role-relevant skill categories when supported by the skills bank. Surface the strongest
+  supported tools both in project context and in Skills instead of leaving useful profile evidence unused.
 - Preserve contact information from the profile.
 - If edit instructions request bold or italic text, use only inline Typst #strong[...] or #emph[...] in the affected string fields.
 - job_title: the exact job title as stated in the job posting (e.g. "Senior ML Engineer", "Backend Developer").
@@ -206,13 +245,17 @@ Recommend only improvements that can be made from the verified source material.
 
 # Hard Constraints
 - Never ask for fabricated numbers or unsupported claims.
-- Penalize vague bullets, weak targeting, keyword mismatch, bloated phrasing, and poor page discipline.
+- Penalize vague bullets, weak targeting, keyword mismatch, bloated phrasing, poor page discipline, and
+  avoidable under-filling of the page.
 Personalized profile scoring constraints:
 {_private_scorer_constraints(profile)}
 - Reward clear role targeting, exact relevant keywords, strong action verbs, concrete tools/methods, differentiated projects, and measurable outcomes when verified.
 - If numbers are unavailable, recommend sharper scope/context wording rather than invented metrics.
 - Approve only when the draft is strong enough to ship as-is.
 - Keep recommendations practical and prioritized.
+- A one-page compile result proves that the draft fits; it is not a reason to shorten it. If relevant,
+  verified profile or project evidence is missing and the draft is structurally sparse, require an
+  evidence-rich revision instead of approving it.
 
 # Shared Guidance
 {profile.cv_guidance}
@@ -260,7 +303,15 @@ Current draft JSON:
 Scoring rubric:
 - quality_score: overall CV quality from 0-100.
 - match_score: role match from 0-100.
-- Use stricter scoring when bullets are vague, the role target is unclear, keywords are missing, or the draft looks hard to fit on one page.
+- Use stricter scoring when bullets are vague, the role target is unclear, keywords are missing, the draft
+  looks hard to fit on one page, or it leaves useful one-page space empty despite available evidence.
+- Treat fewer than 2 bullets on a selected project as sparse when its project-bank entry supports at least
+  2 distinct facts. When enough evidence exists, expect roughly 8-10 project bullets total, with 3 bullets
+  on the strongest projects and 2 on supporting projects.
+- Check that the profile emphasizes the candidate's supported strengths and that project coverage is
+  end-to-end: deliverable/purpose, implementation detail, and outcome/validation where facts permit.
+- If compile feedback says `page_count=1`, never recommend general shortening. Recommend enrichment when
+  the resume is sparse, or targeted replacement when a weaker detail should make room for stronger evidence.
 - Check the `profile` field against any configured personalized required phrase. If missing, add a gap and recommendation, lower `quality_score`, set `decision=revise`, and tell `gen` to integrate it naturally.
 - Check the JSON draft against any configured personalized forbidden-content rule. If present, require removal because that content is handled by local configuration or should not appear in generated JSON.
 - Use `decision=approve` only if the draft is ATS-safe, tightly targeted, credible, concise, and materially ready to send.

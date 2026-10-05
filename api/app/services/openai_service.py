@@ -315,7 +315,8 @@ Optional user instructions:
                 "No live LLM credentials are configured and ENABLE_DEMO_MODE is false."
             )
         report = apply_semester_average_score(report, draft, profile)
-        return apply_profile_requirement_score(report, draft, profile)
+        report = apply_profile_requirement_score(report, draft, profile)
+        return apply_content_density_score(report, draft, profile, compile_feedback)
 
     def _generate_with_openai(
         self,
@@ -863,6 +864,82 @@ def apply_profile_requirement_score(
                 report.recommendations,
                 recommendation,
             ) if recommendation else report.recommendations,
+            "revision_brief": revision_brief,
+        }
+    )
+
+
+def apply_content_density_score(
+    report: ResumeScoreReport,
+    draft: ResumeDraft,
+    profile: ProfileData,
+    compile_feedback: str | None,
+) -> ResumeScoreReport:
+    """Prevent a one-page draft from being approved while supported sections are sparse."""
+    page_count_match = re.search(
+        r"\bpage_count\s*=\s*(\d+)\b",
+        compile_feedback or "",
+        flags=re.IGNORECASE,
+    )
+    if not page_count_match or int(page_count_match.group(1)) != 1:
+        return report
+
+    source_projects = {
+        str(project.get("title", "")): project
+        for project in profile.projects
+        if str(project.get("title", "")).strip()
+    }
+    selected_sources = [
+        source_projects[project.title]
+        for project in draft.projects
+        if project.title in source_projects
+    ]
+    sparse_projects = [
+        project.title
+        for project in draft.projects
+        if project.title in source_projects
+        and len(source_projects[project.title].get("facts", [])) >= 2
+        and len(project.bullets) < 2
+    ]
+    supported_bullet_capacity = sum(
+        min(3, len(project.get("facts", [])))
+        for project in selected_sources
+    )
+    expected_bullets = min(8, supported_bullet_capacity)
+    actual_bullets = sum(len(project.bullets) for project in draft.projects)
+    too_few_project_bullets = expected_bullets >= 4 and actual_bullets < expected_bullets
+    too_few_skill_categories = len(profile.skills) >= 3 and len(draft.skills) < 3
+
+    if not sparse_projects and not too_few_project_bullets and not too_few_skill_categories:
+        return report
+
+    issues: list[str] = []
+    if sparse_projects:
+        issues.append("selected projects with only one bullet despite multiple verified facts")
+    if too_few_project_bullets:
+        issues.append(
+            f"only {actual_bullets} project bullets where at least {expected_bullets} are supported"
+        )
+    if too_few_skill_categories:
+        issues.append("fewer than three skill categories despite a broader verified skills bank")
+
+    gap = "The one-page draft is structurally sparse: " + "; ".join(issues) + "."
+    recommendation = (
+        "Use the available page space to strengthen the profile and projects with distinct verified evidence. "
+        "For each supported project, cover the deliverable, concrete implementation, and result or validation; "
+        "retain concise role-relevant skill categories without inventing facts."
+    )
+    revision_brief = report.revision_brief
+    if recommendation.lower() not in revision_brief.lower():
+        revision_brief = f"{recommendation} {revision_brief}".strip()
+    quality_score = min(report.quality_score, 76)
+    return report.model_copy(
+        update={
+            "quality_score": quality_score,
+            "score_band": score_band(quality_score, report.match_score),
+            "decision": "revise",
+            "gaps": append_unique(report.gaps, gap),
+            "recommendations": append_unique(report.recommendations, recommendation),
             "revision_brief": revision_brief,
         }
     )

@@ -33,15 +33,33 @@ jobs:
           python-version: '3.12'
 
       - name: Install API dependencies
-        run: pip install -r api/requirements.txt -r compiler/requirements.txt -r telegram-bot/requirements.txt
+        run: pip install -r api/requirements.txt -r compiler/requirements.txt -r telegram-bot/requirements.txt -r api/tests/requirements.txt
+
+      - name: Install Typst for PDF layout tests
+        env:
+          TYPST_VERSION: '0.13.1'
+        run: |
+          curl -fsSL "https://github.com/typst/typst/releases/download/v${TYPST_VERSION}/typst-x86_64-unknown-linux-musl.tar.xz" -o "$RUNNER_TEMP/typst.tar.xz"
+          tar -xJf "$RUNNER_TEMP/typst.tar.xz" -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/typst-x86_64-unknown-linux-musl" >> "$GITHUB_PATH"
+
+      - name: Install default resume font
+        run: sudo apt-get update && sudo apt-get install -y fonts-dejavu-core
 
       - name: Python syntax check
         run: python -m py_compile api/app/*.py api/app/services/*.py compiler/app/*.py telegram-bot/app/*.py
 
+      - name: Check generated resume defaults
+        run: python scripts/sync_resume_layout.py --check
+
       - name: API unit tests
         env:
           PYTHONPATH: api
+          REQUIRE_RESUME_LAYOUT_TESTS: '1'
         run: python -m unittest discover -s api/tests -v
+
+      - name: Telegram bot unit tests
+        run: python -m unittest discover -s telegram-bot/tests -v
 
       - name: Set up Node
         uses: actions/setup-node@v4
@@ -53,6 +71,10 @@ jobs:
       - name: Build frontend
         working-directory: frontend
         run: npm ci && npm run build
+
+      - name: Test native serverless resume layout
+        working-directory: frontend
+        run: npm run test:resume-layout
 
       - name: Validate regular Docker Compose
         run: docker compose -f docker-compose.yml config

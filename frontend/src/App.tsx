@@ -77,6 +77,7 @@ type AppSettings = {
   reasoning_effort: string;
   abacus_base_url: string;
   output_basename: string;
+  append_company_to_output_name: boolean;
   enable_demo_mode: boolean;
   openai_api_key_configured: boolean;
   abacus_api_key_configured: boolean;
@@ -217,6 +218,7 @@ const emptyAppSettings: AppSettings = {
   reasoning_effort: "low",
   abacus_base_url: "https://routellm.abacus.ai/v1",
   output_basename: "tailored-resume",
+  append_company_to_output_name: false,
   enable_demo_mode: true,
   openai_api_key_configured: false,
   abacus_api_key_configured: false,
@@ -232,7 +234,7 @@ const emptyPersonalization: PersonalizationOptions = {
   forbidden_content_recommendation: "",
   fixed_education_typst: "",
   contact_header_typst: "",
-  layout_density: "compact",
+  layout_density: "comfortable",
   default_profile_text: "",
   extra_prompt_notes: "",
 };
@@ -627,7 +629,7 @@ export function App() {
           role_focus: statelessRoleFocus || null,
           rules: statelessRules,
           research_guidelines: "Score for role fit, factual grounding, one-page density, ATS-readable wording, and recruiter scan clarity.",
-          personalization: { ...emptyPersonalization, layout_density: "compact" },
+          personalization: { ...emptyPersonalization, layout_density: "comfortable" },
           output_basename: statelessOutputName || "tailored-resume",
         }),
       });
@@ -1199,6 +1201,10 @@ export function App() {
                 <input value={appSettings.abacus_base_url} onChange={(event) => setAppSettings({ ...appSettings, abacus_base_url: event.target.value })} />
               </label>
               <label className="check-field">
+                <input checked={appSettings.append_company_to_output_name} onChange={(event) => setAppSettings({ ...appSettings, append_company_to_output_name: event.target.checked })} type="checkbox" />
+                <span>Append a detected employer name to new CV filenames</span>
+              </label>
+              <label className="check-field">
                 <input checked={appSettings.enable_demo_mode} onChange={(event) => setAppSettings({ ...appSettings, enable_demo_mode: event.target.checked })} type="checkbox" />
                 <span>Allow demo mode when no live key is available</span>
               </label>
@@ -1314,7 +1320,7 @@ export function App() {
               <label className="field">
                 <span>CV spacing density</span>
                 <select
-                  value={profile.personalization.layout_density || "compact"}
+                  value={profile.personalization.layout_density || "comfortable"}
                   onChange={(event) => setPersonalization({ layout_density: event.target.value })}
                 >
                   <option value="compact">Compact</option>
